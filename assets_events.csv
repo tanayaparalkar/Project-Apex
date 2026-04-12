@@ -1,0 +1,17 @@
+asset,type,event_type,source,frequency,sensitivity,notes
+NIFTY,Index,CPI (India),Govt Release,Monthly,High,Broad market reacts to inflation
+NIFTY,Index,Fed Rate,FOMC,Quarterly,High,Global liquidity impact
+NIFTY,Index,FII Flows,NSE,Daily,High,Strong correlation with index movement
+BANKNIFTY,Index,RBI MPC,RBI,Bi-monthly,Very High,Banking sector highly rate-sensitive
+BANKNIFTY,Index,FII Flows,NSE,Daily,High,Institutional money drives banks
+NIFTYIT,Index,Fed Rate,FOMC,Quarterly,Very High,IT depends on US economy
+NIFTYIT,Index,US CPI,US Govt,Monthly,High,Impacts outsourcing demand
+NIFTYMetal,Index,Oil Prices,Market Data,Daily,High,Commodity driven sector
+NIFTYMetal,Index,Geopolitical,GDELT/News,Random,High,War/trade affects metals
+INRUSD,Forex,Fed Rate,FOMC,Quarterly,Very High,Interest rate differential
+INRUSD,Forex,CPI (India),Govt Release,Monthly,High,Inflation affects currency
+INRUSD,Forex,FII Flows,NSE,Daily,High,Capital inflow/outflow impact
+Brent Oil,Commodity,Geopolitical,GDELT/News,Random,Very High,War/supply shocks
+Brent Oil,Commodity,OPEC Decisions,News,Monthly,High,Production decisions
+NIFTY,Index,GDP/IIP,Govt Release,Monthly/Quarterly,Medium,Economic growth indicator
+NIFTY,Index,SEBI Policy,SEBI,Random,Medium,Regulatory impact
