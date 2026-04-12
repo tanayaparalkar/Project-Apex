@@ -1,0 +1,59 @@
+{
+    "prices": {
+      "symbol": "string",
+      "datetime": "ISODate",
+      "open": "float",
+      "high": "float",
+      "low": "float",
+      "close": "float",
+      "volume": "int"
+    },
+    "news": {
+      "timestamp": "ISODate",
+      "headline": "string",
+      "source": "string",
+      "sentiment_score": "float",
+      "sentiment_label": "string",
+      "event_type": "string",
+      "confidence": "float"
+    },
+    "events": {
+      "event_name": "string",
+      "timestamp": "ISODate",
+      "actual": "float",
+      "consensus": "float",
+      "previous": "float",
+      "surprise": "float"
+    },
+    "flows": {
+      "date": "ISODate",
+      "fii_net": "float",
+      "dii_net": "float"
+    },
+    "features": {
+      "timestamp": "ISODate",
+      "symbol": "string",
+      "fii_3d_momentum": "float",
+      "news_sentiment_avg": "float",
+      "event_strength": "float",
+      "rsi": "float",
+      "atr": "float",
+      "volume_zscore": "float",
+      "anomaly_flag": "int"
+    },
+    "labels": {
+      "timestamp": "ISODate",
+      "symbol": "string",
+      "move": "int",
+      "return_1d": "float",
+      "return_3d": "float"
+    },
+    "predictions": {
+      "timestamp": "ISODate",
+      "symbol": "string",
+      "predicted_move": "int",
+      "expected_return": "float",
+      "confidence": "float",
+      "top_features": ["string"]
+    }
+  }
