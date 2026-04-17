@@ -6,8 +6,8 @@
 
 const API_BASE =
   import.meta.env.MODE === "development"
-    ? "http://localhost:5000"
-    : "https://project-apex-baip.onrender.com";
+    ? "http://localhost:5000/api"
+    : "/api";
 
 async function fetchJSON(url) {
   const res = await fetch(url);

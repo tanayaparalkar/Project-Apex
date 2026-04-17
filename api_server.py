@@ -24,14 +24,14 @@ import os
 import sys
 import logging
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from pymongo import MongoClient
 from dotenv import load_dotenv
-from bson import json_util
 import json
 
 load_dotenv()
@@ -51,6 +51,16 @@ MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME   = "eventoracle"
 IST       = timezone(timedelta(hours=5, minutes=30))
 
+# Path to the React build output (npm run build → frontend/dist/)
+FRONTEND_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
+
+app = Flask(
+    __name__,
+    static_folder=str(FRONTEND_DIR),
+    static_url_path="",
+)
+CORS(app)
+
 KNOWN_ASSETS = [
     "NIFTY", "BANKNIFTY", "NIFTYIT", "NIFTYMETAL",
     "INRUSD", "BRENT", "GOLD", "SILVER", "PLATINUM", "BITCOIN",
@@ -69,9 +79,6 @@ ASSET_KEYWORDS = {
     "PLATINUM":   ["platinum", "pgm"],
     "BITCOIN":    ["bitcoin", "btc", "crypto", "cryptocurrency"],
 }
-
-app = Flask(__name__)
-CORS(app)
 
 # ─────────────────────────────────────────────
 # DATABASE
@@ -380,6 +387,20 @@ def get_asset_summary(asset: str):
 
 
 # ─────────────────────────────────────────────
+# SPA CATCH-ALL (serves React frontend)
+# ─────────────────────────────────────────────
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_spa(path):
+    """Serve the React SPA. API routes take precedence (registered above)."""
+    if path and (FRONTEND_DIR / path).is_file():
+        return send_from_directory(str(FRONTEND_DIR), path)
+    # For any other route, serve index.html (React handles client-side routing)
+    return send_from_directory(str(FRONTEND_DIR), "index.html")
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 
@@ -391,4 +412,5 @@ if __name__ == "__main__":
         log.error(f"Failed to connect to MongoDB: {e}")
         sys.exit(1)
 
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=(os.getenv("FLASK_ENV") != "production"))

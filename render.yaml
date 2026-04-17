@@ -1,0 +1,22 @@
+# render.yaml – Render Deployment Config for EventOracle
+# Single web service: Flask serves the React build + API endpoints
+
+services:
+  - type: web
+    name: project-apex
+    runtime: python
+    buildCommand: |
+      pip install -r requirements.txt
+      cd frontend && npm install && npm run build && cd ..
+    startCommand: gunicorn api_server:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: MONGO_URI
+        sync: false  # Set this manually in Render dashboard
+      - key: GEMINI_API_KEY
+        sync: false  # Optional – set in Render dashboard for AI agent
+      - key: FLASK_ENV
+        value: production
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: NODE_VERSION
+        value: "20"
