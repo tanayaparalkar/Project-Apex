@@ -348,8 +348,14 @@ def fetch_data(lookback_days: int = 730) -> pd.DataFrame:
         if not fii_df.empty and not dii_df.empty:
             merged = fii_df.merge(dii_df, on="date", suffixes=("_fii", "_dii"))
             merged = merged.rename(columns={"net_value_fii": "fii_net", "net_value_dii": "dii_net"})
-            log.info(f"[FETCH] NSE API succeeded → {len(merged)} rows.")
-            return merged
+            
+            # Ensure we actually got a reasonable amount of data if asking for history
+            unique_dates = merged["date"].nunique()
+            if lookback_days > 30 and unique_dates < (lookback_days * 0.1):
+                log.warning(f"[FETCH] NSE API only returned {unique_dates} unique dates, falling back to historical sources...")
+            else:
+                log.info(f"[FETCH] NSE API succeeded → {len(merged)} rows, {unique_dates} unique dates.")
+                return merged
 
     # ── Attempt 2: NSE CSV fallback ──────────────────────────
     raw_csv = fetch_nse_csv_fallback(lookback_days=lookback_days)
@@ -359,8 +365,13 @@ def fetch_data(lookback_days: int = 730) -> pd.DataFrame:
         if not fii_df.empty and not dii_df.empty:
             merged = fii_df.merge(dii_df, on="date", suffixes=("_fii", "_dii"))
             merged = merged.rename(columns={"net_value_fii": "fii_net", "net_value_dii": "dii_net"})
-            log.info(f"[FETCH] NSE CSV fallback succeeded → {len(merged)} rows.")
-            return merged
+            
+            unique_dates = merged["date"].nunique()
+            if lookback_days > 30 and unique_dates < (lookback_days * 0.1):
+                log.warning(f"[FETCH] NSE CSV only returned {unique_dates} unique dates, falling back...")
+            else:
+                log.info(f"[FETCH] NSE CSV fallback succeeded → {len(merged)} rows, {unique_dates} unique dates.")
+                return merged
 
     # ── Attempt 3: Placeholder data ──────────────────────────
     return get_placeholder_data(lookback_days=lookback_days)
@@ -405,24 +416,15 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.rename(columns={date_col: "timestamp"})
 
-    # ── Parse to date then build UTC-midnight datetime ───────
-    # Step 1: coerce to pandas datetime (naive)
+    # ── Convert timestamp → IST-aware datetime ───────────────
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     null_dates = df["timestamp"].isna().sum()
     if null_dates > 0:
         log.warning(f"[CLEAN] Dropping {null_dates} rows with unparseable timestamps.")
         df = df.dropna(subset=["timestamp"])
 
-    # Step 2: keep only the calendar date (strip any time component), then
-    #         reconstruct as UTC midnight — identical to what yfinance delivers
-    #         and what market_pipeline stores in MongoDB.
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"].dt.date  # plain Python date objects
-    ).dt.tz_localize("UTC")      # attach UTC → midnight UTC, matches prices docs
-
-    # Step 3: convert to IST so the in-memory frame is IST-aware (consistent
-    #         with the rest of the pipeline's IST convention) while the stored
-    #         UTC value remains 00:00:00+00:00.
+    if df["timestamp"].dt.tz is None:
+        df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
     df["timestamp"] = df["timestamp"].dt.tz_convert(IST)
 
     # ── Ensure required columns exist ───────────────────────
@@ -522,29 +524,19 @@ def add_features(df: pd.DataFrame, prices_col=None, news_col=None) -> pd.DataFra
             if nifty_docs:
                 nifty_df = pd.DataFrame(nifty_docs)
 
-                # Normalize prices timestamps to UTC midnight (same convention
-                # market_pipeline uses) so the merge key is identical to flows.
                 nifty_df["timestamp"] = pd.to_datetime(nifty_df["timestamp"])
                 if nifty_df["timestamp"].dt.tz is None:
                     nifty_df["timestamp"] = nifty_df["timestamp"].dt.tz_localize("UTC")
-                # Strip to UTC midnight to guarantee alignment
-                nifty_df["timestamp"] = nifty_df["timestamp"].dt.normalize().dt.tz_convert("UTC")
-
-                # Align flows timestamps to UTC for the merge key
-                flows_utc = df["timestamp"].dt.tz_convert("UTC").dt.normalize()
+                nifty_df["timestamp"] = nifty_df["timestamp"].dt.tz_convert(IST)
 
                 nifty_df = nifty_df.rename(columns={"close": "nifty_close"})
                 nifty_df = nifty_df.drop_duplicates(subset=["timestamp"])
 
-                # Temporary UTC key column for merging
-                df["_ts_utc"] = flows_utc
-                nifty_df = nifty_df.rename(columns={"timestamp": "_ts_utc"})
-
-                df = df.merge(nifty_df[["_ts_utc", "nifty_close"]], on="_ts_utc", how="left")
+                df = df.merge(nifty_df[["timestamp", "nifty_close"]], on="timestamp", how="left")
                 df["flow_to_price_ratio"] = (
                     df["total_flow"] / df["nifty_close"].replace(0, np.nan)
                 ).round(6)
-                df = df.drop(columns=["_ts_utc", "nifty_close"])
+                df = df.drop(columns=["nifty_close"])
 
                 matched = df["flow_to_price_ratio"].notna().sum()
                 log.info(f"[FEATURES] flow_to_price_ratio computed for {matched} rows.")
@@ -561,23 +553,20 @@ def add_features(df: pd.DataFrame, prices_col=None, news_col=None) -> pd.DataFra
             anomaly_mask = df["flow_anomaly"] & (df["flow_zscore"] > 0)
             anomaly_dates = df.loc[anomaly_mask, "timestamp"]
             if not anomaly_dates.empty:
-                # Use UTC midnight datetimes to match stored news timestamps
-                anomaly_utc_list = (
-                    anomaly_dates.dt.tz_convert("UTC").dt.normalize().dt.to_pydatetime().tolist()
-                )
+                anomaly_date_list = anomaly_dates.dt.to_pydatetime().tolist()
                 neg_news = list(news_col.find({
-                    "published_at": {"$in": anomaly_utc_list},
+                    "published_at": {"$in": anomaly_date_list},
                     "sentiment_score": {"$lt": -0.2},
                 }, {"_id": 0, "published_at": 1}))
                 if neg_news:
-                    conflict_utc = set(
-                        pd.Timestamp(doc["published_at"])
-                        .tz_localize("UTC" if pd.Timestamp(doc["published_at"]).tzinfo is None else None)
-                        .normalize()
+                    conflict_dates = set(
+                        pd.to_datetime(doc["published_at"]).replace(
+                            hour=0, minute=0, second=0, microsecond=0,
+                            tzinfo=IST
+                        )
                         for doc in neg_news
                     )
-                    flows_utc_norm = df["timestamp"].dt.tz_convert("UTC").dt.normalize()
-                    df["sentiment_conflict"] = flows_utc_norm.isin(conflict_utc)
+                    df["sentiment_conflict"] = df["timestamp"].isin(conflict_dates)
                     log.info(
                         f"[FEATURES] sentiment_conflict flagged on "
                         f"{df['sentiment_conflict'].sum()} days."
@@ -645,12 +634,7 @@ def upload_to_mongo(df: pd.DataFrame, db, dry_run: bool = False) -> int:
     for rec in records:
         ts = rec.get("timestamp")
         if hasattr(ts, "to_pydatetime"):
-            # Convert IST-aware timestamp → UTC Python datetime for storage.
-            # This produces 2024-05-16T00:00:00+00:00 — identical to prices docs.
-            utc_ts = ts.astimezone(timezone.utc)
-            rec["timestamp"] = utc_ts.replace(tzinfo=None)  # naive UTC, matches market_pipeline
-        elif isinstance(ts, datetime) and ts.tzinfo is not None:
-            rec["timestamp"] = ts.astimezone(timezone.utc).replace(tzinfo=None)
+            rec["timestamp"] = ts.to_pydatetime()
 
         # Replace NaN/pd.NA/None with None for clean BSON storage
         for k, v in rec.items():
