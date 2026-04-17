@@ -26,3 +26,6 @@ python-dotenv>=1.0.0
 
 # Timezone handling
 pytz>=2024.1
+
+# Generative AI Agent
+google-genai>=0.3.0
