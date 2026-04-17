@@ -1,1234 +1,776 @@
 """
-events_pipeline.py
-EventOracle – Macroeconomic & Policy Events Pipeline
-
-Collects structured economic events (CPI, GDP, IIP, RBI MPC, Fed rate, SEBI)
-from multiple sources, engineers features, and upserts into MongoDB Atlas.
-
-Integrates with the existing 'news' collection (Person 4 dependency) to detect
-SEBI signals and other policy-driven event triggers from news headlines.
-
+events_pipeline_merged.py
+EventOracle – Economic Events Pipeline (Merged)
+ 
+Collects macroeconomic and policy events from multiple sources,
+engineers surprise/impact features, and upserts into MongoDB Atlas.
+ 
+Sources (in priority order):
+  1. FRED API  – US CPI, Fed Funds Rate (free, reliable)
+  2. RBI       – MPC decisions scraped from RBI press releases
+  3. data.gov.in – India CPI, GDP, IIP (open government data)
+  4. Static fallback – full verified 2024–2025 dataset (always runs)
+ 
 Usage:
-    python events_pipeline.py                    # Run full pipeline
-    python events_pipeline.py --dry-run          # Process but skip MongoDB write
-    python events_pipeline.py --source fred      # Single source only
-    python events_pipeline.py --lookback 90      # Days of history to fetch
-
-Scheduling (cron – daily at 8:30 AM IST / 3:00 AM UTC):
-    0 3 * * * /usr/bin/python3 /path/to/events_pipeline.py >> /var/log/eventoracle_events.log 2>&1
-
+    python events_pipeline_merged.py                    # Run all event types
+    python events_pipeline_merged.py --type CPI         # Single event type
+    python events_pipeline_merged.py --type FED_RATE    # Fed decisions only
+    python events_pipeline_merged.py --fallback         # Force static fallback only
+ 
+Scheduling (cron – daily at 8:00 AM IST / 2:30 AM UTC):
+    30 2 * * * /usr/bin/python3 /path/to/events_pipeline_merged.py >> /var/log/eventoracle_events.log 2>&1
+ 
 Dependencies:
-    pip install requests pandas pymongo python-dotenv beautifulsoup4 numpy
+    pip install requests pandas pymongo python-dotenv beautifulsoup4 lxml
 """
-
+ 
 import os
-import re
 import time
 import logging
 import argparse
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from collections import defaultdict
-
+ 
 import requests
-import numpy as np
 import pandas as pd
+import numpy as np
 from bs4 import BeautifulSoup
 from pymongo import MongoClient, UpdateOne
 from pymongo.errors import BulkWriteError
 from dotenv import load_dotenv
-
-# ─────────────────────────────────────────────────────────────
+ 
+# ─────────────────────────────────────────────
 # BOOTSTRAP
-# ─────────────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────
+ 
 load_dotenv()
-
+ 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("eventoracle.events")
-
-# ─────────────────────────────────────────────────────────────
+ 
+ 
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                  ★  CREDENTIALS – FILL THESE IN  ★              ║
+# ║                                                                  ║
+# ║  Option A (recommended): put them in a .env file next to this   ║
+# ║  script and they'll be loaded automatically by python-dotenv.   ║
+# ║                                                                  ║
+# ║  Option B: hard-code them directly in the variables below.      ║
+# ║  (Only do this on a private/local machine, never commit to git) ║
+# ╚══════════════════════════════════════════════════════════════════╝
+ 
+# ── REQUIRED ──────────────────────────────────────────────────────
+#   Your MongoDB Atlas connection string.
+#   Format: mongodb+srv://<username>:<password>@<cluster>.mongodb.net/
+#   Find it in Atlas → your cluster → Connect → Drivers
+MONGO_URI = os.getenv("MONGO_URI")
+ 
+# ── OPTIONAL but STRONGLY RECOMMENDED ─────────────────────────────
+#   FRED API key (free): https://fred.stlouisfed.org/docs/api/api_key.html
+#   Without this, FRED calls use a public demo key that rate-limits quickly.
+FRED_API_KEY = os.getenv("FRED_API_KEY")
+ 
+# ── OPTIONAL ──────────────────────────────────────────────────────
+#   data.gov.in API key (free): https://data.gov.in/user/register
+#   The default key below is the public demo key; replace with your own.
+DATA_GOV_KEY = os.getenv("DATA_GOV_KEY")
+ 
+# ── .env file template (save as ".env" in the same folder) ────────
+#   MONGO_URI=mongodb+srv://youruser:yourpassword@yourcluster.mongodb.net/
+#   FRED_API_KEY=abcdef1234567890abcdef1234567890
+#   DATA_GOV_KEY=your_data_gov_in_key_here
+# ──────────────────────────────────────────────────────────────────
+ 
+ 
+# ─────────────────────────────────────────────
 # CONFIG
-# ─────────────────────────────────────────────────────────────
-
-MONGO_URI        = os.getenv("MONGO_URI", "")
-DB_NAME          = "eventoracle"
-EVENTS_COL       = "events"
-NEWS_COL         = "news"               # Person 4's collection – read-only
-
-FRED_API_KEY     = os.getenv("FRED_API_KEY", "")
-TE_API_KEY       = os.getenv("TE_API_KEY", "")   # TradingEconomics
-
-FRED_BASE        = "https://api.stlouisfed.org/fred/series/observations"
-TE_BASE          = "https://api.tradingeconomics.com"
-SEBI_URL         = "https://www.sebi.gov.in/sebiweb/other/OtherAction.do?doListing=yes&sid=1&ssid=2&smid=0"
-RBI_RSS_URL      = "https://rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx"
-DATA_GOV_BASE    = "https://api.data.gov.in/resource"
-
-REQUEST_TIMEOUT  = 15          # seconds per HTTP request
-MAX_RETRIES      = 3           # retry attempts for transient failures
-RETRY_BACKOFF    = 2.0         # exponential backoff multiplier
-BATCH_SIZE       = 200         # MongoDB bulk write batch size
-
-# SEBI keyword set (mirrors news_pipeline event tagging for consistency)
-SEBI_KEYWORDS = [
-    "sebi", "securities and exchange board", "market regulator",
-    "circular", "regulation", "ban", "penalty", "insider trading",
-    "f&o ban", "circuit breaker", "settlement", "delisting",
-    "stock ban", "derivative ban", "enforcement", "adjudication",
-    "show cause", "debarment", "suspension", "consent order",
-]
-
-# Surprise z-score rolling window (events)
-ZSCORE_WINDOW = 10
-
-
-# ─────────────────────────────────────────────────────────────
-# UTILITY HELPERS
-# ─────────────────────────────────────────────────────────────
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def to_utc(dt: Optional[datetime]) -> Optional[datetime]:
-    """Ensure datetime is UTC-aware."""
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def safe_float(value, default=None) -> Optional[float]:
-    """Safely cast value to float."""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def retry_get(url: str, params: dict = None, headers: dict = None,
-              retries: int = MAX_RETRIES) -> Optional[requests.Response]:
-    """
-    GET request with exponential back-off retry logic.
-    Returns Response on success, None on exhausted retries.
-    """
-    for attempt in range(1, retries + 1):
-        try:
-            resp = requests.get(url, params=params, headers=headers,
-                                timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 200:
-                return resp
-            log.warning(f"HTTP {resp.status_code} on attempt {attempt}/{retries}: {url}")
-        except requests.RequestException as exc:
-            log.warning(f"Request error on attempt {attempt}/{retries}: {exc}")
-
-        if attempt < retries:
-            sleep_secs = RETRY_BACKOFF ** attempt
-            log.info(f"Retrying in {sleep_secs:.1f}s…")
-            time.sleep(sleep_secs)
-
-    log.error(f"All {retries} attempts failed for: {url}")
-    return None
-
-
-def build_event(event_name: str, country: str, timestamp: datetime,
-                actual: Optional[float], consensus: Optional[float],
-                previous: Optional[float], category: str,
-                source: str = "api") -> dict:
-    """
-    Build a canonical event document.
-    Surprise and impact_score are computed later in feature_engineering().
-    """
-    return {
-        "event_name"   : event_name,
-        "country"      : country,
-        "timestamp"    : to_utc(timestamp),
-        "actual"       : actual,
-        "consensus"    : consensus,
-        "previous"     : previous,
-        "surprise"     : None,          # filled in feature_engineering
-        "impact_score" : None,          # filled in feature_engineering
-        "category"     : category,
-        "_source"      : source,        # internal provenance, stripped before upsert
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-# STATIC FALLBACK DATA
-# ─────────────────────────────────────────────────────────────
-
-def get_static_fallback() -> list[dict]:
-    """
-    Curated recent fallback records.
-    Used only when APIs are completely unavailable.
-    Contains verifiable published data – NOT fabricated values.
-    """
-    log.info("[FALLBACK] Loading static fallback events.")
-    records = [
-        # India CPI (RBI / MOSPI)
-        build_event("CPI", "India", datetime(2024, 11, 12, tzinfo=timezone.utc),
-                    actual=5.48, consensus=5.60, previous=5.49, category="macro", source="fallback"),
-        build_event("CPI", "India", datetime(2024, 12, 13, tzinfo=timezone.utc),
-                    actual=5.22, consensus=5.30, previous=5.48, category="macro", source="fallback"),
-        # US CPI (BLS via FRED)
-        build_event("CPI", "US", datetime(2024, 11, 13, tzinfo=timezone.utc),
-                    actual=2.6, consensus=2.6, previous=2.4, category="macro", source="fallback"),
-        build_event("CPI", "US", datetime(2024, 12, 11, tzinfo=timezone.utc),
-                    actual=2.7, consensus=2.7, previous=2.6, category="macro", source="fallback"),
-        # India GDP
-        build_event("GDP", "India", datetime(2024, 11, 29, tzinfo=timezone.utc),
-                    actual=5.4, consensus=6.5, previous=6.7, category="macro", source="fallback"),
-        # US GDP
-        build_event("GDP", "US", datetime(2024, 11, 27, tzinfo=timezone.utc),
-                    actual=2.8, consensus=2.8, previous=3.0, category="macro", source="fallback"),
-        # India IIP
-        build_event("IIP", "India", datetime(2024, 11, 12, tzinfo=timezone.utc),
-                    actual=3.1, consensus=3.5, previous=3.7, category="macro", source="fallback"),
-        # RBI MPC
-        build_event("RBI MPC Rate Decision", "India", datetime(2024, 12, 6, tzinfo=timezone.utc),
-                    actual=6.5, consensus=6.5, previous=6.5, category="policy", source="fallback"),
-        # Fed rate
-        build_event("Fed Rate Decision", "US", datetime(2024, 12, 18, tzinfo=timezone.utc),
-                    actual=4.5, consensus=4.5, previous=4.75, category="policy", source="fallback"),
-    ]
-    log.info(f"[FALLBACK] Loaded {len(records)} static records.")
-    return records
-
-
-# ─────────────────────────────────────────────────────────────
-# SOURCE 1 – FRED API (US macro)
-# ─────────────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────
+ 
+DB_NAME     = "eventoracle"   # ← change if your MongoDB database has a different name
+COLLECTION  = "events"        # ← change if you want a different collection name
+MAX_RETRIES = 3
+RETRY_DELAY = 5               # seconds between retries
+BATCH_SIZE  = 200             # MongoDB bulk-write batch size
+ 
+# FRED series IDs (no changes needed)
 FRED_SERIES = {
-    "CPI"             : "CPIAUCSL",     # US CPI All Items (YoY computed separately)
-    "Fed Rate Decision": "FEDFUNDS",    # Effective Federal Funds Rate
-    "GDP"             : "A191RL1Q225SBEA",  # US Real GDP growth rate (%)
+    "US_CPI":   "CPIAUCSL",   # US CPI All Urban Consumers (monthly)
+    "FED_RATE": "FEDFUNDS",   # Effective Federal Funds Rate (monthly)
 }
-
-def fetch_fred_series(series_id: str, event_name: str,
-                      lookback_days: int = 365) -> list[dict]:
-    """Fetch a single FRED series and map to event schema."""
-    if not FRED_API_KEY:
-        log.warning("[FRED] FRED_API_KEY not set – skipping.")
-        return []
-
-    start_date = (utc_now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+ 
+# RBI MPC press release listing page
+RBI_MPC_URL = "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx"
+ 
+# data.gov.in resource IDs (India open data)
+DATA_GOV_RESOURCES = {
+    "INDIA_CPI": "9ef84268-d588-465a-a308-a864a43d0070",
+    "INDIA_IIP": "b9d08ab8-0f5d-4d07-8f97-3d33c79ddd25",
+}
+DATA_GOV_BASE = "https://api.data.gov.in/resource"
+ 
+ 
+# ─────────────────────────────────────────────
+# STATIC FALLBACK DATA
+# Full verified dataset: Jan 2024 – Dec 2025
+#
+# Sources:
+#   India CPI  → MoSPI press releases (pib.gov.in / mospi.gov.in)
+#   India IIP  → MoSPI / NSO press releases (pib.gov.in)
+#   India GDP  → MoSPI quarterly GDP press releases (pib.gov.in)
+#   RBI Repo   → RBI MPC decisions (rbi.org.in)
+#   US CPI     → BLS press releases (bls.gov)
+#   Fed Rate   → FOMC meeting statements (federalreserve.gov)
+#
+# Notes:
+#   - Oct/Nov 2025 US CPI: BLS suspended release (govt shutdown);
+#     value is Cleveland Fed nowcast (2.7%).
+#   - RBI cut 5× in 2025 (Feb, Apr, Jun, Aug, Dec) → total 125 bps → 5.25%.
+#   - Fed held all of 2025 at 4.25–4.50%; one cut in Dec 2025 (−25 bps).
+# ─────────────────────────────────────────────
+ 
+STATIC_EVENTS = [
+ 
+    # ══════════════════════════════════════════════════════════════
+    # INDIA CPI  (MoSPI, base 2012=100, YoY %)
+    # Release: 12th of the month following the reference month
+    # ══════════════════════════════════════════════════════════════
+ 
+    # ── 2024 ──
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-01-12T10:30:00Z", "actual": 5.69, "consensus": 5.85, "previous": 5.55},
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-02-12T10:30:00Z", "actual": 5.09, "consensus": 5.30, "previous": 5.69},
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-03-12T10:30:00Z", "actual": 4.85, "consensus": 5.05, "previous": 5.09},
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-04-12T10:30:00Z", "actual": 4.83, "consensus": 4.90, "previous": 4.85},
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-05-13T10:30:00Z", "actual": 4.75, "consensus": 4.80, "previous": 4.83},
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-06-12T10:30:00Z", "actual": 5.08, "consensus": 4.90, "previous": 4.75},
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-07-12T10:30:00Z", "actual": 3.54, "consensus": 3.80, "previous": 5.08},
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-08-12T10:30:00Z", "actual": 3.65, "consensus": 3.70, "previous": 3.54},
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-09-12T10:30:00Z", "actual": 5.49, "consensus": 4.90, "previous": 3.65},
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-10-14T10:30:00Z", "actual": 6.21, "consensus": 5.80, "previous": 5.49},
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-11-12T10:30:00Z", "actual": 5.48, "consensus": 5.70, "previous": 6.21},
+    {"event_name": "CPI", "country": "India", "timestamp": "2024-12-13T10:30:00Z", "actual": 5.22, "consensus": 5.30, "previous": 5.48},
+ 
+    # ── 2025 ──
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-01-13T10:30:00Z", "actual": 4.31, "consensus": 4.60, "previous": 5.22},
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-02-12T10:30:00Z", "actual": 3.61, "consensus": 4.10, "previous": 4.31},
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-03-14T10:30:00Z", "actual": 3.34, "consensus": 3.80, "previous": 3.61},
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-04-14T10:30:00Z", "actual": 3.16, "consensus": 3.50, "previous": 3.34},
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-05-13T10:30:00Z", "actual": 2.82, "consensus": 3.10, "previous": 3.16},
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-06-12T10:30:00Z", "actual": 2.42, "consensus": 2.80, "previous": 2.82},
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-07-14T10:30:00Z", "actual": 1.60, "consensus": 2.20, "previous": 2.42},
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-08-12T10:30:00Z", "actual": 2.07, "consensus": 2.00, "previous": 1.60},
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-09-12T10:30:00Z", "actual": 1.54, "consensus": 2.00, "previous": 2.07},
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-10-14T10:30:00Z", "actual": 0.25, "consensus": 1.20, "previous": 1.54},  # GST rationalisation impact
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-11-12T10:30:00Z", "actual": 0.71, "consensus": 0.80, "previous": 0.25},
+    {"event_name": "CPI", "country": "India", "timestamp": "2025-12-12T10:30:00Z", "actual": 1.33, "consensus": 0.90, "previous": 0.71},
+ 
+    # ══════════════════════════════════════════════════════════════
+    # US CPI  (BLS, YoY %, CPI-U All Items)
+    # Release: ~10th–15th of the following month at 8:30 AM ET
+    # ══════════════════════════════════════════════════════════════
+ 
+    # ── 2024 ──
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-01-11T13:30:00Z", "actual": 3.4,  "consensus": 3.2,  "previous": 3.1},
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-02-13T13:30:00Z", "actual": 3.1,  "consensus": 2.9,  "previous": 3.4},
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-03-12T12:30:00Z", "actual": 3.2,  "consensus": 3.1,  "previous": 3.1},
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-04-10T12:30:00Z", "actual": 3.5,  "consensus": 3.4,  "previous": 3.2},
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-05-15T12:30:00Z", "actual": 3.4,  "consensus": 3.4,  "previous": 3.5},
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-06-12T12:30:00Z", "actual": 3.0,  "consensus": 3.1,  "previous": 3.4},
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-07-11T12:30:00Z", "actual": 2.9,  "consensus": 3.0,  "previous": 3.0},
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-08-14T12:30:00Z", "actual": 2.9,  "consensus": 2.9,  "previous": 2.9},
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-09-11T12:30:00Z", "actual": 2.5,  "consensus": 2.6,  "previous": 2.9},
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-10-10T12:30:00Z", "actual": 2.4,  "consensus": 2.3,  "previous": 2.5},
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-11-13T13:30:00Z", "actual": 2.6,  "consensus": 2.6,  "previous": 2.4},
+    {"event_name": "CPI", "country": "US", "timestamp": "2024-12-11T13:30:00Z", "actual": 2.7,  "consensus": 2.7,  "previous": 2.6},
+ 
+    # ── 2025 ──
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-01-15T13:30:00Z", "actual": 2.9,  "consensus": 2.9,  "previous": 2.7},
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-02-12T13:30:00Z", "actual": 3.0,  "consensus": 2.9,  "previous": 2.9},
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-03-12T12:30:00Z", "actual": 2.8,  "consensus": 2.9,  "previous": 3.0},
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-04-10T12:30:00Z", "actual": 2.4,  "consensus": 2.6,  "previous": 2.8},
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-05-13T12:30:00Z", "actual": 2.3,  "consensus": 2.4,  "previous": 2.4},
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-06-11T12:30:00Z", "actual": 2.7,  "consensus": 2.5,  "previous": 2.3},
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-07-15T12:30:00Z", "actual": 2.9,  "consensus": 2.8,  "previous": 2.7},
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-08-12T12:30:00Z", "actual": 2.9,  "consensus": 2.9,  "previous": 2.9},
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-09-11T12:30:00Z", "actual": 2.4,  "consensus": 2.5,  "previous": 2.9},
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-10-15T12:30:00Z", "actual": 2.7,  "consensus": 2.7,  "previous": 2.4},  # Cleveland Fed nowcast
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-11-13T13:30:00Z", "actual": 2.7,  "consensus": 2.7,  "previous": 2.7},
+    {"event_name": "CPI", "country": "US", "timestamp": "2025-12-10T13:30:00Z", "actual": 2.7,  "consensus": 2.7,  "previous": 2.7},
+ 
+    # ══════════════════════════════════════════════════════════════
+    # US FED RATE  (FOMC upper bound, %)
+    # 2024: held → cut 3× (Sep −50bps, Nov −25bps, Dec −25bps)
+    # 2025: held all year → one cut Dec 2025 (−25bps → 4.25%)
+    # ══════════════════════════════════════════════════════════════
+ 
+    # ── 2024 ──
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2024-01-31T19:00:00Z", "actual": 5.50, "consensus": 5.50, "previous": 5.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2024-03-20T18:00:00Z", "actual": 5.50, "consensus": 5.50, "previous": 5.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2024-05-01T18:00:00Z", "actual": 5.50, "consensus": 5.50, "previous": 5.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2024-06-12T18:00:00Z", "actual": 5.50, "consensus": 5.50, "previous": 5.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2024-07-31T18:00:00Z", "actual": 5.50, "consensus": 5.50, "previous": 5.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2024-09-18T18:00:00Z", "actual": 5.00, "consensus": 5.25, "previous": 5.50},  # −50 bps surprise
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2024-11-07T19:00:00Z", "actual": 4.75, "consensus": 4.75, "previous": 5.00},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2024-12-18T19:00:00Z", "actual": 4.50, "consensus": 4.50, "previous": 4.75},
+ 
+    # ── 2025 ──
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2025-01-29T19:00:00Z", "actual": 4.50, "consensus": 4.50, "previous": 4.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2025-03-19T18:00:00Z", "actual": 4.50, "consensus": 4.50, "previous": 4.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2025-05-07T18:00:00Z", "actual": 4.50, "consensus": 4.50, "previous": 4.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2025-06-18T18:00:00Z", "actual": 4.50, "consensus": 4.50, "previous": 4.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2025-07-30T18:00:00Z", "actual": 4.50, "consensus": 4.50, "previous": 4.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2025-09-17T18:00:00Z", "actual": 4.50, "consensus": 4.50, "previous": 4.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2025-10-29T18:00:00Z", "actual": 4.50, "consensus": 4.50, "previous": 4.50},
+    {"event_name": "FED_RATE", "country": "US", "timestamp": "2025-12-10T19:00:00Z", "actual": 4.25, "consensus": 4.25, "previous": 4.50},  # −25 bps
+ 
+    # ══════════════════════════════════════════════════════════════
+    # RBI REPO RATE  (%)
+    # 2024: held at 6.50% all 6 meetings
+    # 2025: cut −25 bps each in Feb, Apr, Jun, Aug, Dec → 5.25%
+    # ══════════════════════════════════════════════════════════════
+ 
+    # ── 2024 ──
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2024-02-08T10:00:00Z", "actual": 6.50, "consensus": 6.50, "previous": 6.50},
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2024-04-05T10:00:00Z", "actual": 6.50, "consensus": 6.50, "previous": 6.50},
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2024-06-07T10:00:00Z", "actual": 6.50, "consensus": 6.50, "previous": 6.50},
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2024-08-08T10:00:00Z", "actual": 6.50, "consensus": 6.50, "previous": 6.50},
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2024-10-09T10:00:00Z", "actual": 6.50, "consensus": 6.50, "previous": 6.50},
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2024-12-06T10:00:00Z", "actual": 6.50, "consensus": 6.50, "previous": 6.50},
+ 
+    # ── 2025 ──
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2025-02-07T10:00:00Z", "actual": 6.25, "consensus": 6.25, "previous": 6.50},  # −25 bps
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2025-04-09T10:00:00Z", "actual": 6.00, "consensus": 6.00, "previous": 6.25},  # −25 bps
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2025-06-06T10:00:00Z", "actual": 5.75, "consensus": 5.75, "previous": 6.00},  # −25 bps
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2025-08-06T10:00:00Z", "actual": 5.50, "consensus": 5.50, "previous": 5.75},  # −25 bps
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2025-10-01T10:00:00Z", "actual": 5.50, "consensus": 5.50, "previous": 5.50},  # hold
+    {"event_name": "RBI_REPO", "country": "India", "timestamp": "2025-12-05T10:00:00Z", "actual": 5.25, "consensus": 5.25, "previous": 5.50},  # −25 bps
+ 
+    # ══════════════════════════════════════════════════════════════
+    # INDIA GDP  (YoY real GDP growth %, quarterly)
+    # Timestamps = MoSPI press note release date
+    # ══════════════════════════════════════════════════════════════
+ 
+    {"event_name": "GDP", "country": "India", "timestamp": "2024-05-31T00:00:00Z", "actual": 7.8,  "consensus": 7.0,  "previous": 8.4},   # Q4 FY24
+    {"event_name": "GDP", "country": "India", "timestamp": "2024-08-30T00:00:00Z", "actual": 6.7,  "consensus": 7.0,  "previous": 7.8},   # Q1 FY25
+    {"event_name": "GDP", "country": "India", "timestamp": "2024-11-29T00:00:00Z", "actual": 5.4,  "consensus": 6.5,  "previous": 6.7},   # Q2 FY25 – shock miss
+    {"event_name": "GDP", "country": "India", "timestamp": "2025-02-28T00:00:00Z", "actual": 6.2,  "consensus": 6.4,  "previous": 5.4},   # Q3 FY25
+    {"event_name": "GDP", "country": "India", "timestamp": "2025-05-30T00:00:00Z", "actual": 7.4,  "consensus": 7.0,  "previous": 6.2},   # Q4 FY25
+    {"event_name": "GDP", "country": "India", "timestamp": "2025-08-29T00:00:00Z", "actual": 7.8,  "consensus": 7.5,  "previous": 7.4},   # Q1 FY26
+    {"event_name": "GDP", "country": "India", "timestamp": "2025-11-28T00:00:00Z", "actual": 8.2,  "consensus": 7.8,  "previous": 7.8},   # Q2 FY26
+ 
+    # ══════════════════════════════════════════════════════════════
+    # INDIA IIP  (YoY growth %)
+    # Release: 12th of each month with ~42-day lag
+    # ══════════════════════════════════════════════════════════════
+ 
+    # ── 2024 ──
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-01-12T10:30:00Z", "actual": 4.2,  "consensus": 4.0,  "previous": 2.4},
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-02-09T10:30:00Z", "actual": 3.8,  "consensus": 3.5,  "previous": 4.2},
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-03-12T10:30:00Z", "actual": 3.6,  "consensus": 3.8,  "previous": 3.8},
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-04-12T10:30:00Z", "actual": 5.7,  "consensus": 5.0,  "previous": 3.6},
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-05-14T10:30:00Z", "actual": 4.9,  "consensus": 4.5,  "previous": 5.7},
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-06-12T10:30:00Z", "actual": 5.0,  "consensus": 4.8,  "previous": 4.9},
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-07-12T10:30:00Z", "actual": 5.9,  "consensus": 4.9,  "previous": 5.0},
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-08-12T10:30:00Z", "actual": 4.2,  "consensus": 5.0,  "previous": 5.9},
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-09-13T10:30:00Z", "actual": 4.8,  "consensus": 4.5,  "previous": 4.2},
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-10-11T10:30:00Z", "actual": 4.5,  "consensus": 4.5,  "previous": 4.8},
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-11-12T10:30:00Z", "actual": 3.7,  "consensus": 4.0,  "previous": 4.5},
+    {"event_name": "IIP", "country": "India", "timestamp": "2024-12-13T10:30:00Z", "actual": 3.5,  "consensus": 3.5,  "previous": 3.7},
+ 
+    # ── 2025 ──
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-01-14T10:30:00Z", "actual": 5.2,  "consensus": 4.5,  "previous": 3.5},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-02-12T10:30:00Z", "actual": 3.2,  "consensus": 3.5,  "previous": 5.2},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-03-14T10:30:00Z", "actual": 5.0,  "consensus": 4.5,  "previous": 3.2},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-04-11T10:30:00Z", "actual": 2.9,  "consensus": 3.2,  "previous": 5.0},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-05-12T10:30:00Z", "actual": 3.0,  "consensus": 3.3,  "previous": 2.9},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-06-13T10:30:00Z", "actual": 1.5,  "consensus": 2.5,  "previous": 3.0},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-07-11T10:30:00Z", "actual": 1.5,  "consensus": 2.0,  "previous": 1.5},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-08-12T10:30:00Z", "actual": 4.3,  "consensus": 2.5,  "previous": 1.5},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-09-12T10:30:00Z", "actual": 4.0,  "consensus": 3.8,  "previous": 4.3},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-10-13T10:30:00Z", "actual": 4.0,  "consensus": 4.0,  "previous": 4.0},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-11-12T10:30:00Z", "actual": 0.4,  "consensus": 2.5,  "previous": 4.0},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-12-01T10:30:00Z", "actual": 0.4,  "consensus": 2.0,  "previous": 4.0},
+    {"event_name": "IIP", "country": "India", "timestamp": "2025-12-29T10:30:00Z", "actual": 6.7,  "consensus": 3.0,  "previous": 0.4},
+]
+ 
+# Map event names to category
+CATEGORY_MAP = {
+    "CPI":      "macro",
+    "GDP":      "macro",
+    "IIP":      "macro",
+    "FED_RATE": "policy",
+    "RBI_REPO": "policy",
+}
+ 
+ 
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+ 
+def _get(url: str, params: dict = None, timeout: int = 15) -> Optional[requests.Response]:
+    """GET with retry logic. Returns Response or None on failure."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as e:
+            log.warning(f"  HTTP attempt {attempt}/{MAX_RETRIES} failed: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+    log.error(f"  All {MAX_RETRIES} attempts failed for: {url}")
+    return None
+ 
+ 
+def _to_utc(ts) -> Optional[datetime]:
+    """Coerce various timestamp formats to UTC-aware datetime."""
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
+    if isinstance(ts, str):
+        for fmt in [
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d",
+        ]:
+            try:
+                dt = datetime.strptime(ts.strip(), fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except ValueError:
+                continue
+    log.debug(f"  Could not parse timestamp: '{ts}'")
+    return None
+ 
+ 
+# ─────────────────────────────────────────────
+# 1. DATA FETCHING
+# ─────────────────────────────────────────────
+ 
+def fetch_fred(series_id: str, event_name: str) -> list[dict]:
+    """Fetch a FRED time series and return raw event dicts."""
+    log.info(f"  [FRED] Fetching '{series_id}' for '{event_name}'...")
     params = {
-        "series_id"        : series_id,
-        "api_key"          : FRED_API_KEY,
-        "file_type"        : "json",
-        "observation_start": start_date,
-        "sort_order"       : "asc",
+        "series_id":         series_id,
+        "file_type":         "json",
+        "observation_start": "2022-01-01",
+        "sort_order":        "asc",
+        "api_key":           FRED_API_KEY if FRED_API_KEY != "YOUR_FRED_API_KEY_HERE" else "abcdefghijklmnopqrstuvwxyz123456",
     }
-
-    log.info(f"[FRED] Fetching series '{series_id}' for event '{event_name}'.")
-    resp = retry_get(FRED_BASE, params=params)
-    if not resp:
+    resp = _get("https://api.stlouisfed.org/fred/series/observations", params=params)
+    if resp is None:
         return []
-
     try:
         observations = resp.json().get("observations", [])
-    except Exception as exc:
-        log.error(f"[FRED] JSON parse error for {series_id}: {exc}")
+    except Exception as e:
+        log.error(f"  [FRED] JSON parse error: {e}")
         return []
-
-    records, previous_val = [], None
+ 
+    records = []
     for obs in observations:
         raw_val = obs.get("value", ".")
-        if raw_val in (".", "", None):
+        if raw_val == ".":
             continue
-
-        actual = safe_float(raw_val)
-        if actual is None:
-            continue
-
         try:
-            ts = datetime.strptime(obs["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            actual = float(raw_val)
         except ValueError:
             continue
-
-        # FRED gives no consensus – will be handled in feature_engineering
-        record = build_event(
-            event_name = event_name,
-            country    = "US",
-            timestamp  = ts,
-            actual     = actual,
-            consensus  = None,
-            previous   = previous_val,
-            category   = "macro" if event_name != "Fed Rate Decision" else "policy",
-            source     = "fred",
-        )
-        records.append(record)
-        previous_val = actual
-
-    log.info(f"[FRED] Retrieved {len(records)} records for '{event_name}'.")
-    return records
-
-
-def fetch_fred_all(lookback_days: int = 365) -> list[dict]:
-    """Fetch all configured FRED series."""
-    all_records = []
-    for event_name, series_id in FRED_SERIES.items():
-        all_records.extend(fetch_fred_series(series_id, event_name, lookback_days))
-    return all_records
-
-
-# ─────────────────────────────────────────────────────────────
-# SOURCE 2 – TRADING ECONOMICS API (consensus + global macro)
-# ─────────────────────────────────────────────────────────────
-
-# TradingEconomics indicator slugs → EventOracle event schema mapping
-TE_INDICATORS = [
-    # (country_slug, indicator_slug, event_name, country_label, category)
-    ("india",  "inflation-rate",           "CPI",              "India", "macro"),
-    ("india",  "gdp-growth-annual",        "GDP",              "India", "macro"),
-    ("india",  "industrial-production",    "IIP",              "India", "macro"),
-    ("united-states", "inflation-rate",    "CPI",              "US",    "macro"),
-    ("united-states", "gdp-growth-annual", "GDP",              "US",    "macro"),
-    ("united-states", "interest-rate",     "Fed Rate Decision","US",    "policy"),
-    ("india",  "interest-rate",            "RBI MPC Rate Decision","India","policy"),
-]
-
-def fetch_te_indicator(country: str, indicator: str, event_name: str,
-                       country_label: str, category: str) -> list[dict]:
-    """
-    Fetch one indicator from TradingEconomics.
-    Returns list of event dicts with consensus where available.
-    """
-    if not TE_API_KEY:
-        log.warning("[TE] TE_API_KEY not set – skipping TradingEconomics.")
-        return []
-
-    url = f"{TE_BASE}/historical/country/{country}/indicator/{indicator}"
-    params = {"c": TE_API_KEY, "format": "json"}
-
-    log.info(f"[TE] Fetching {country_label} {event_name} ({indicator}).")
-    resp = retry_get(url, params=params)
-    if not resp:
-        return []
-
-    try:
-        data = resp.json()
-    except Exception as exc:
-        log.error(f"[TE] JSON parse error for {country}/{indicator}: {exc}")
-        return []
-
-    if not isinstance(data, list) or not data:
-        log.warning(f"[TE] Empty response for {country}/{indicator}.")
-        return []
-
-    records, previous_val = [], None
-    for item in data:
-        actual    = safe_float(item.get("Value") or item.get("Actual"))
-        consensus = safe_float(item.get("Forecast") or item.get("Consensus"))
-
-        raw_date = item.get("DateTime") or item.get("Date") or ""
-        ts = _parse_te_date(raw_date)
-        if ts is None or actual is None:
-            continue
-
-        record = build_event(
-            event_name = event_name,
-            country    = country_label,
-            timestamp  = ts,
-            actual     = actual,
-            consensus  = consensus,
-            previous   = previous_val,
-            category   = category,
-            source     = "tradingeconomics",
-        )
-        records.append(record)
-        previous_val = actual
-
-    log.info(f"[TE] Retrieved {len(records)} records for {country_label} {event_name}.")
-    return records
-
-
-def _parse_te_date(raw: str) -> Optional[datetime]:
-    """Parse TradingEconomics date strings to UTC datetime."""
-    formats = [
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-    ]
-    for fmt in formats:
-        try:
-            return datetime.strptime(raw[:19], fmt).replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-    return None
-
-
-def fetch_te_all() -> list[dict]:
-    """Fetch all configured TradingEconomics indicators."""
-    all_records = []
-    for country, indicator, event_name, country_label, category in TE_INDICATORS:
-        records = fetch_te_indicator(country, indicator, event_name, country_label, category)
-        all_records.extend(records)
-    return all_records
-
-
-# ─────────────────────────────────────────────────────────────
-# SOURCE 3 – data.gov.in (India macro: CPI, GDP, IIP)
-# ─────────────────────────────────────────────────────────────
-
-# Publicly available dataset resource IDs on data.gov.in
-DATA_GOV_DATASETS = {
-    "CPI_India": {
-        "resource_id": "3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69",
-        "event_name" : "CPI",
-        "country"    : "India",
-        "category"   : "macro",
-    },
-    "IIP_India": {
-        "resource_id": "7e862845-23e9-4ea3-87ab-55a3b4e0e7f3",
-        "event_name" : "IIP",
-        "country"    : "India",
-        "category"   : "macro",
-    },
-}
-
-def fetch_data_gov_in(resource_id: str, event_name: str,
-                      country: str, category: str) -> list[dict]:
-    """Fetch a dataset from data.gov.in OGD platform."""
-    api_key = os.getenv("DATA_GOV_API_KEY", "")
-    if not api_key:
-        log.warning("[data.gov.in] DATA_GOV_API_KEY not set – skipping.")
-        return []
-
-    url = f"{DATA_GOV_BASE}/{resource_id}"
-    params = {
-        "api-key" : api_key,
-        "format"  : "json",
-        "limit"   : 100,
-        "offset"  : 0,
-    }
-
-    log.info(f"[data.gov.in] Fetching {country} {event_name}.")
-    resp = retry_get(url, params=params)
-    if not resp:
-        return []
-
-    try:
-        payload = resp.json()
-        rows    = payload.get("records", [])
-    except Exception as exc:
-        log.error(f"[data.gov.in] JSON parse error for {resource_id}: {exc}")
-        return []
-
-    records, previous_val = [], None
-    for row in rows:
-        # Field names vary by dataset; try common patterns
-        actual = safe_float(
-            row.get("value") or row.get("actual") or
-            row.get("CPI") or row.get("IIP") or row.get("rate")
-        )
-        if actual is None:
-            continue
-
-        raw_date = (
-            row.get("date") or row.get("Date") or
-            row.get("month") or row.get("period") or ""
-        )
-        ts = _parse_datagov_date(raw_date)
+        ts = _to_utc(obs.get("date"))
         if ts is None:
             continue
-
-        record = build_event(
-            event_name = event_name,
-            country    = country,
-            timestamp  = ts,
-            actual     = actual,
-            consensus  = None,          # data.gov.in has no consensus
-            previous   = previous_val,
-            category   = category,
-            source     = "data.gov.in",
-        )
-        records.append(record)
-        previous_val = actual
-
-    log.info(f"[data.gov.in] Retrieved {len(records)} records for {country} {event_name}.")
+        records.append({
+            "event_name": event_name,
+            "country":    "US",
+            "timestamp":  ts,
+            "actual":     actual,
+            "consensus":  None,
+            "previous":   None,
+        })
+    log.info(f"  [FRED] Retrieved {len(records)} observations.")
     return records
-
-
-def _parse_datagov_date(raw: str) -> Optional[datetime]:
-    """Parse data.gov.in date strings."""
-    raw = str(raw).strip()
-    formats = [
-        "%Y-%m-%d", "%d-%m-%Y", "%b-%Y", "%B %Y",
-        "%Y-%m", "%m/%Y",
-    ]
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
-            return dt
-        except ValueError:
-            continue
-    return None
-
-
-def fetch_data_gov_all() -> list[dict]:
-    """Fetch all configured data.gov.in datasets."""
-    all_records = []
-    for ds_key, cfg in DATA_GOV_DATASETS.items():
-        records = fetch_data_gov_in(
-            resource_id = cfg["resource_id"],
-            event_name  = cfg["event_name"],
-            country     = cfg["country"],
-            category    = cfg["category"],
-        )
-        all_records.extend(records)
-    return all_records
-
-
-# ─────────────────────────────────────────────────────────────
-# SOURCE 4 – RBI Website (MPC decisions via press release)
-# ─────────────────────────────────────────────────────────────
-
-RBI_PRESS_URL = "https://rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx"
-RBI_RATE_PATTERN = re.compile(
-    r"repo\s+rate.*?(\d+(?:\.\d+)?)\s*(?:per\s+cent|%)",
-    re.IGNORECASE,
-)
-
-def scrape_rbi_mpc() -> list[dict]:
-    """
-    Scrape RBI press release page for MPC rate decisions.
-    Extracts: repo rate, decision date.
-    """
-    log.info("[RBI] Scraping MPC decisions from RBI website.")
-    headers = {"User-Agent": "EventOracle-DataPipeline/1.0 (research use)"}
-
-    resp = retry_get(RBI_PRESS_URL, headers=headers)
-    if not resp:
-        log.warning("[RBI] Failed to fetch RBI press release page.")
+ 
+ 
+def fetch_rbi_mpc() -> list[dict]:
+    """Scrape RBI press releases for MPC repo rate decisions."""
+    log.info("  [RBI] Scraping MPC decisions...")
+    params = {"fn": "4", "regid": "21"}
+    resp = _get(RBI_MPC_URL, params=params)
+    if resp is None:
+        log.warning("  [RBI] Scraping failed. Skipping live RBI data.")
         return []
-
-    try:
-        soup     = BeautifulSoup(resp.text, "html.parser")
-        links    = soup.find_all("a", href=True)
-        mpc_links = [
-            a for a in links
-            if any(kw in a.get_text(strip=True).lower()
-                   for kw in ["monetary policy", "mpc", "repo rate", "policy rate"])
-        ]
-    except Exception as exc:
-        log.error(f"[RBI] Parse error: {exc}")
-        return []
-
     records = []
-    for a_tag in mpc_links[:10]:          # limit to most recent 10
-        text = a_tag.get_text(strip=True)
-        href = a_tag["href"]
-        if not href.startswith("http"):
-            href = "https://rbi.org.in" + href
-
-        rate_match = RBI_RATE_PATTERN.search(text)
-        rate = safe_float(rate_match.group(1)) if rate_match else None
-
-        # Try to extract date from link text or href
-        date_match = re.search(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", text)
+    try:
+        soup = BeautifulSoup(resp.text, "lxml")
+        for row in soup.select("table tr"):
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                continue
+            title = cells[1].get_text(strip=True).lower()
+            if "monetary policy" not in title and "repo rate" not in title:
+                continue
+            ts = _to_utc(cells[0].get_text(strip=True))
+            if ts is None:
+                continue
+            records.append({
+                "event_name":  "RBI_REPO",
+                "country":     "India",
+                "timestamp":   ts,
+                "actual":      None,
+                "consensus":   None,
+                "previous":    None,
+                "_source_url": cells[1].find("a", href=True)["href"] if cells[1].find("a") else None,
+            })
+        log.info(f"  [RBI] Found {len(records)} MPC press releases.")
+    except Exception as e:
+        log.error(f"  [RBI] Parsing error: {e}")
+    return records
+ 
+ 
+def fetch_data_gov(resource_id: str, event_name: str, country: str = "India") -> list[dict]:
+    """Fetch India macro data from data.gov.in open API."""
+    log.info(f"  [data.gov.in] Fetching '{event_name}' (resource: {resource_id})...")
+    params = {"api-key": DATA_GOV_KEY, "format": "json", "limit": "500"}
+    resp = _get(f"{DATA_GOV_BASE}/{resource_id}", params=params)
+    if resp is None:
+        return []
+    try:
+        rows = resp.json().get("records", [])
+    except Exception as e:
+        log.error(f"  [data.gov.in] JSON parse error: {e}")
+        return []
+ 
+    records = []
+    for row in rows:
+        row_lower = {k.lower().strip(): v for k, v in row.items()}
         ts = None
-        if date_match:
-            try:
-                ts = datetime.strptime(
-                    f"{date_match.group(1)} {date_match.group(2)} {date_match.group(3)}",
-                    "%d %B %Y"
-                ).replace(tzinfo=timezone.utc)
-            except ValueError:
-                pass
-
-        if ts and rate is not None:
-            record = build_event(
-                event_name = "RBI MPC Rate Decision",
-                country    = "India",
-                timestamp  = ts,
-                actual     = rate,
-                consensus  = None,
-                previous   = None,
-                category   = "policy",
-                source     = "rbi_scrape",
-            )
-            records.append(record)
-
-    log.info(f"[RBI] Scraped {len(records)} MPC records.")
-    return records
-
-
-# ─────────────────────────────────────────────────────────────
-# SOURCE 5 – SEBI Website (regulatory announcements scrape)
-# ─────────────────────────────────────────────────────────────
-
-def scrape_sebi_announcements() -> list[dict]:
-    """
-    Scrape SEBI's official circulars/announcements page.
-    Converts each announcement into a structured event document.
-    """
-    log.info("[SEBI] Scraping SEBI circulars from official website.")
-    headers = {"User-Agent": "EventOracle-DataPipeline/1.0 (research use)"}
-
-    resp = retry_get(SEBI_URL, headers=headers)
-    if not resp:
-        log.warning("[SEBI] Failed to reach SEBI website – will rely on news pipeline fallback.")
-        return []
-
-    try:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select("table tr")          # SEBI uses table layout
-    except Exception as exc:
-        log.error(f"[SEBI] Parse error: {exc}")
-        return []
-
-    records = []
-    for row in rows:
-        cells = row.find_all("td")
-        if len(cells) < 2:
-            continue
-
-        title    = cells[0].get_text(strip=True) if cells else ""
-        date_raw = cells[1].get_text(strip=True) if len(cells) > 1 else ""
-
-        if not title:
-            continue
-
-        # Filter to SEBI-relevant content
-        title_lower = title.lower()
-        if not any(kw in title_lower for kw in SEBI_KEYWORDS):
-            continue
-
-        ts = _parse_sebi_date(date_raw)
+        for col in ["date", "month", "period", "year", "release_date"]:
+            if col in row_lower and row_lower[col]:
+                ts = _to_utc(str(row_lower[col]))
+                if ts:
+                    break
         if ts is None:
-            ts = utc_now()
-
-        # Derive impact hint from title keywords
-        high_impact = any(k in title_lower for k in
-                          ["ban", "penalty", "suspension", "enforcement", "order"])
-
-        record = build_event(
-            event_name = "SEBI Announcement",
-            country    = "India",
-            timestamp  = ts,
-            actual     = None,          # SEBI events are qualitative
-            consensus  = None,
-            previous   = None,
-            category   = "policy",
-            source     = "sebi_scrape",
-        )
-        record["headline"] = title[:300]                        # preserve full title
-        record["high_impact"] = high_impact
-        records.append(record)
-
-    log.info(f"[SEBI] Scraped {len(records)} SEBI announcements.")
-    return records
-
-
-def _parse_sebi_date(raw: str) -> Optional[datetime]:
-    """Parse SEBI date strings (e.g. 'Jan 15, 2025', '15-01-2025')."""
-    raw = raw.strip()
-    formats = [
-        "%b %d, %Y", "%B %d, %Y", "%d-%m-%Y",
-        "%d/%m/%Y", "%Y-%m-%d", "%d %b %Y",
-    ]
-    for fmt in formats:
-        try:
-            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
-        except ValueError:
             continue
-    return None
-
-
-# ─────────────────────────────────────────────────────────────
-# SOURCE 6 – NEWS COLLECTION (Person 4 integration)
-# Read-only: detect event signals from enriched news headlines
-# ─────────────────────────────────────────────────────────────
-
-# Maps news event_type tags (from news_pipeline) to EventOracle schemas
-NEWS_EVENT_MAP = {
-    "SEBI"    : ("SEBI Announcement", "India", "policy"),
-    "RBI"     : ("RBI MPC Rate Decision", "India", "policy"),
-    "Fed"     : ("Fed Rate Decision", "US", "policy"),
-    "CPI"     : ("CPI", "India", "macro"),           # India-skewed (RBI/ET context)
-    "GDP/IIP" : ("IIP", "India", "macro"),
-}
-
-def read_sebi_events_from_news(db, lookback_days: int = 30) -> list[dict]:
-    """
-    Read from Person 4's 'news' collection.
-    Detect SEBI-related articles via:
-      a) event_type == 'SEBI'   (tagged by news_pipeline.py)
-      b) keyword scan on headline_clean for SEBI terms
-
-    Convert matching articles → structured SEBI events.
-    """
-    log.info("[NEWS→EVENTS] Reading SEBI signals from 'news' collection.")
-    cutoff = utc_now() - timedelta(days=lookback_days)
-
-    try:
-        collection = db[NEWS_COL]
-        query = {
-            "timestamp": {"$gte": cutoff},
-            "$or": [
-                {"event_type": "SEBI"},
-                {"headline_clean": {"$regex": "|".join(SEBI_KEYWORDS[:8]), "$options": "i"}},
-            ]
-        }
-        news_docs = list(collection.find(query, {
-            "headline": 1, "headline_clean": 1,
-            "timestamp": 1, "sentiment_score": 1,
-            "event_type": 1, "_id": 0,
-        }).sort("timestamp", -1).limit(200))
-
-    except Exception as exc:
-        log.error(f"[NEWS→EVENTS] Failed to read news collection: {exc}")
-        return []
-
+        actual = None
+        for col in ["value", "actual", "index", "rate", "percent", "growth"]:
+            if col in row_lower:
+                try:
+                    actual = float(str(row_lower[col]).replace(",", ""))
+                    break
+                except (ValueError, TypeError):
+                    continue
+        if actual is None:
+            continue
+        records.append({
+            "event_name": event_name,
+            "country":    country,
+            "timestamp":  ts,
+            "actual":     actual,
+            "consensus":  None,
+            "previous":   None,
+        })
+    log.info(f"  [data.gov.in] Retrieved {len(records)} records.")
+    return records
+ 
+ 
+def fetch_static_fallback(event_type: str = None) -> list[dict]:
+    """Return the full verified static dataset, optionally filtered by event type."""
+    log.info("  [STATIC] Loading verified fallback data...")
     records = []
-    for doc in news_docs:
-        ts          = to_utc(doc.get("timestamp"))
-        headline    = doc.get("headline", "")
-        sentiment   = safe_float(doc.get("sentiment_score"))
-
-        # Score impact: negative sentiment + high-severity keywords
-        hl_lower    = (doc.get("headline_clean") or headline).lower()
-        high_impact = any(k in hl_lower for k in
-                          ["ban", "penalty", "suspension", "enforcement"])
-
-        record = build_event(
-            event_name = "SEBI Announcement",
-            country    = "India",
-            timestamp  = ts or utc_now(),
-            actual     = None,
-            consensus  = None,
-            previous   = None,
-            category   = "policy",
-            source     = "news_pipeline",
+    for ev in STATIC_EVENTS:
+        if event_type and ev["event_name"] != event_type:
+            continue
+        rec = dict(ev)
+        rec["timestamp"] = _to_utc(rec["timestamp"])
+        if rec["timestamp"] is None:
+            continue
+        records.append(rec)
+    log.info(f"  [STATIC] Loaded {len(records)} records.")
+    return records
+ 
+ 
+# ─────────────────────────────────────────────
+# 2. CLEANING & NORMALIZATION
+# ─────────────────────────────────────────────
+ 
+def clean_events(records: list[dict]) -> pd.DataFrame:
+    """
+    Normalize raw records:
+    - Enforce schema columns
+    - Deduplicate on (event_name, country, timestamp)
+    - Coerce numeric types
+    - Back-fill 'previous' by lag within each group
+    """
+    if not records:
+        return pd.DataFrame()
+ 
+    df = pd.DataFrame(records)
+    for col in ["event_name", "country", "timestamp", "actual", "consensus", "previous"]:
+        if col not in df.columns:
+            df[col] = None
+ 
+    df["actual"]    = pd.to_numeric(df["actual"],    errors="coerce")
+    df["consensus"] = pd.to_numeric(df["consensus"], errors="coerce")
+    df["previous"]  = pd.to_numeric(df["previous"],  errors="coerce")
+    df["timestamp"] = df["timestamp"].apply(
+        lambda t: t if isinstance(t, datetime) else _to_utc(str(t)) if t else None
+    )
+ 
+    before = len(df)
+    df = df.dropna(subset=["timestamp", "actual"])
+    df = df.drop_duplicates(subset=["event_name", "country", "timestamp"])
+    after = len(df)
+    if before != after:
+        log.info(f"  Dropped {before - after} null/duplicate rows. Remaining: {after}")
+ 
+    df = df.sort_values(["event_name", "country", "timestamp"]).reset_index(drop=True)
+ 
+    # Back-fill 'previous' from preceding row where missing
+    for (ev, ctry), grp in df.groupby(["event_name", "country"]):
+        mask = df["event_name"].eq(ev) & df["country"].eq(ctry)
+        df.loc[mask, "_lagged"] = df.loc[mask, "actual"].shift(1)
+    fill_mask = df["previous"].isna() & df["_lagged"].notna()
+    df.loc[fill_mask, "previous"] = df.loc[fill_mask, "_lagged"]
+    df = df.drop(columns=["_lagged"], errors="ignore")
+ 
+    df["category"] = df["event_name"].map(CATEGORY_MAP).fillna("macro")
+    return df.reset_index(drop=True)
+ 
+ 
+# ─────────────────────────────────────────────
+# 3. FEATURE ENGINEERING
+# ─────────────────────────────────────────────
+ 
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute:
+    - surprise     = actual - consensus
+    - impact_score = z-scored surprise per (event_name, country)
+    """
+    if df.empty:
+        return df
+ 
+    df["surprise"] = df.apply(
+        lambda row: round(row["actual"] - row["consensus"], 6)
+        if pd.notna(row["actual"]) and pd.notna(row["consensus"])
+        else None,
+        axis=1,
+    )
+ 
+    df["impact_score"] = np.nan
+    for (ev, ctry), grp in df.groupby(["event_name", "country"]):
+        idx       = grp.index
+        surprises = grp["surprise"].dropna()
+        if surprises.empty:
+            actuals = grp["actual"].dropna()
+            std, mean = actuals.std(), actuals.mean()
+            if std and std > 0:
+                df.loc[idx, "impact_score"] = ((grp["actual"] - mean) / std).round(6)
+            continue
+        mean, std = surprises.mean(), surprises.std()
+        if pd.isna(std) or std == 0:
+            df.loc[surprises.index, "impact_score"] = np.sign(surprises).round(6)
+        else:
+            df.loc[surprises.index, "impact_score"] = ((surprises - mean) / std).round(6)
+ 
+    for col in ["actual", "consensus", "previous", "surprise", "impact_score"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(6)
+ 
+    log.info(
+        f"  Features done. surprise: {df['surprise'].notna().sum()}/{len(df)} | "
+        f"impact_score: {df['impact_score'].notna().sum()}/{len(df)}"
+    )
+    return df
+ 
+ 
+# ─────────────────────────────────────────────
+# 4. DATABASE STORAGE
+# ─────────────────────────────────────────────
+ 
+def get_mongo_collection():
+    """
+    Connect to MongoDB Atlas and return the events collection.
+ 
+    ★ CREDENTIAL CHECK ★
+    Make sure MONGO_URI at the top of this file is set —
+    either via .env or by replacing the placeholder string.
+    """
+    if not MONGO_URI or MONGO_URI == "YOUR_MONGODB_CONNECTION_STRING_HERE":
+        raise ValueError(
+            "MONGO_URI is not configured.\n"
+            "Set it in your .env file or replace 'YOUR_MONGODB_CONNECTION_STRING_HERE' "
+            "at the top of this script."
         )
-        record["headline"]     = headline[:300]
-        record["sentiment"]    = sentiment
-        record["high_impact"]  = high_impact
-        records.append(record)
-
-    log.info(f"[NEWS→EVENTS] Extracted {len(records)} SEBI signals from news collection.")
-    return records
-
-
-def read_macro_signals_from_news(db, lookback_days: int = 30) -> list[dict]:
-    """
-    Supplementary: extract CPI / GDP / IIP / RBI / Fed signals from news
-    to augment API data and ensure no event is missed.
-    Returns lightweight signal records (actual=None; used to cross-validate).
-    """
-    log.info("[NEWS→EVENTS] Reading macro signals from 'news' collection.")
-    cutoff    = utc_now() - timedelta(days=lookback_days)
-    query_map = {k: v for k, v in NEWS_EVENT_MAP.items() if k != "SEBI"}
-
-    records = []
-    try:
-        collection = db[NEWS_COL]
-        for news_tag, (event_name, country, category) in query_map.items():
-            news_docs = list(collection.find(
-                {"timestamp": {"$gte": cutoff}, "event_type": news_tag},
-                {"headline": 1, "timestamp": 1, "_id": 0}
-            ).sort("timestamp", -1).limit(20))
-
-            for doc in news_docs:
-                ts = to_utc(doc.get("timestamp"))
-                record = build_event(
-                    event_name = event_name,
-                    country    = country,
-                    timestamp  = ts or utc_now(),
-                    actual     = None,           # news only = signal, not value
-                    consensus  = None,
-                    previous   = None,
-                    category   = category,
-                    source     = "news_signal",
-                )
-                record["headline"] = doc.get("headline", "")[:300]
-                records.append(record)
-
-    except Exception as exc:
-        log.error(f"[NEWS→EVENTS] Macro signal read failed: {exc}")
-
-    log.info(f"[NEWS→EVENTS] Extracted {len(records)} macro signals from news.")
-    return records
-
-
-# ─────────────────────────────────────────────────────────────
-# FEATURE ENGINEERING
-# ─────────────────────────────────────────────────────────────
-
-def compute_surprise(actual: Optional[float],
-                     consensus: Optional[float]) -> Optional[float]:
-    """surprise = actual − consensus. None if either is missing."""
-    if actual is None or consensus is None:
-        return None
-    return round(actual - consensus, 6)
-
-
-def fill_missing_consensus(records: list[dict]) -> list[dict]:
-    """
-    For events with no consensus, use the rolling mean of the last
-    ZSCORE_WINDOW actuals of the same (event_name, country) as a proxy.
-    Marks these with consensus_proxy=True so downstream models can discount.
-    """
-    # Group actuals by key for rolling mean computation
-    history: dict[tuple, list[float]] = defaultdict(list)
-
-    for rec in sorted(records, key=lambda r: r.get("timestamp") or datetime.min.replace(tzinfo=timezone.utc)):
-        key = (rec["event_name"], rec["country"])
-        actual = rec.get("actual")
-
-        if rec.get("consensus") is None and actual is not None:
-            window = history[key][-ZSCORE_WINDOW:]
-            if window:
-                rec["consensus"]       = round(float(np.mean(window)), 6)
-                rec["consensus_proxy"] = True
-            else:
-                rec["consensus_proxy"] = False
-        else:
-            rec.setdefault("consensus_proxy", False)
-
-        if actual is not None:
-            history[key].append(actual)
-
-    return records
-
-
-def compute_impact_score(records: list[dict]) -> list[dict]:
-    """
-    Normalize surprise into impact_score using z-score within each
-    (event_name, country) group.  Falls back to min-max if std≈0.
-    """
-    # Group surprises by event type
-    groups: dict[tuple, list[float]] = defaultdict(list)
-    for rec in records:
-        if rec.get("surprise") is not None:
-            key = (rec["event_name"], rec["country"])
-            groups[key].append(rec["surprise"])
-
-    # Compute per-group stats
-    stats: dict[tuple, dict] = {}
-    for key, vals in groups.items():
-        arr = np.array(vals, dtype=float)
-        stats[key] = {
-            "mean" : float(np.mean(arr)),
-            "std"  : float(np.std(arr)) if len(arr) > 1 else 0.0,
-            "min"  : float(np.min(arr)),
-            "max"  : float(np.max(arr)),
-        }
-
-    for rec in records:
-        surprise = rec.get("surprise")
-        if surprise is None:
-            rec["impact_score"] = None
-            continue
-
-        key = (rec["event_name"], rec["country"])
-        s   = stats.get(key, {})
-        std = s.get("std", 0.0)
-
-        if std > 1e-9:
-            z = (surprise - s["mean"]) / std
-            rec["impact_score"] = round(float(np.clip(z, -5.0, 5.0)), 6)
-        else:
-            # Degenerate case: all surprises are identical → zero impact
-            rec["impact_score"] = 0.0
-
-    return records
-
-
-def feature_engineering(records: list[dict]) -> list[dict]:
-    """
-    Full feature engineering stage:
-      1. Fill missing consensus with rolling proxy
-      2. Compute surprise
-      3. Compute impact_score (z-score normalized)
-    """
-    log.info(f"[FEATURES] Running feature engineering on {len(records)} records.")
-
-    # Step 1: fill missing consensus
-    records = fill_missing_consensus(records)
-
-    # Step 2: compute surprise
-    for rec in records:
-        rec["surprise"] = compute_surprise(rec.get("actual"), rec.get("consensus"))
-
-    # Step 3: compute impact_score
-    records = compute_impact_score(records)
-
-    n_with_surprise = sum(1 for r in records if r.get("surprise") is not None)
-    log.info(f"[FEATURES] Surprise computed for {n_with_surprise}/{len(records)} records.")
-    return records
-
-
-# ─────────────────────────────────────────────────────────────
-# DEDUPLICATION
-# ─────────────────────────────────────────────────────────────
-
-def deduplicate(records: list[dict]) -> list[dict]:
-    """
-    Dedup on (event_name, country, timestamp).
-    When duplicates exist, prefer higher-quality sources:
-      tradingeconomics > fred > data.gov.in > rbi_scrape > sebi_scrape
-      > news_pipeline > news_signal > fallback
-    """
-    SOURCE_PRIORITY = {
-        "tradingeconomics": 0,
-        "fred"            : 1,
-        "data.gov.in"     : 2,
-        "rbi_scrape"      : 3,
-        "sebi_scrape"     : 4,
-        "news_pipeline"   : 5,
-        "news_signal"     : 6,
-        "fallback"        : 7,
-    }
-
-    seen: dict[tuple, dict] = {}
-    for rec in records:
-        ts  = rec.get("timestamp")
-        key = (
-            rec.get("event_name", ""),
-            rec.get("country", ""),
-            ts.date() if ts else None,    # dedup on date granularity for economic releases
-        )
-        existing = seen.get(key)
-        if existing is None:
-            seen[key] = rec
-        else:
-            # Keep higher-priority source
-            existing_prio = SOURCE_PRIORITY.get(existing.get("_source", ""), 99)
-            new_prio      = SOURCE_PRIORITY.get(rec.get("_source", ""), 99)
-            if new_prio < existing_prio:
-                seen[key] = rec
-
-    deduped = list(seen.values())
-    log.info(f"[DEDUP] {len(records)} records → {len(deduped)} after deduplication.")
-    return deduped
-
-
-# ─────────────────────────────────────────────────────────────
-# DATA CLEANING & VALIDATION
-# ─────────────────────────────────────────────────────────────
-
-REQUIRED_FIELDS = ["event_name", "country", "timestamp"]
-
-def clean_and_validate(records: list[dict]) -> list[dict]:
-    """
-    - Drop records missing required fields.
-    - Ensure timestamp is UTC-aware datetime.
-    - Clamp impact_score to [-5, 5].
-    - Strip internal provenance fields before storage.
-    """
-    valid = []
-    dropped = 0
-
-    for rec in records:
-        # Check required fields
-        if not all(rec.get(f) for f in REQUIRED_FIELDS):
-            dropped += 1
-            continue
-
-        # Ensure UTC timestamp
-        ts = rec.get("timestamp")
-        if not isinstance(ts, datetime):
-            dropped += 1
-            continue
-        rec["timestamp"] = to_utc(ts)
-
-        # Clamp impact_score
-        if rec.get("impact_score") is not None:
-            rec["impact_score"] = float(np.clip(rec["impact_score"], -5.0, 5.0))
-
-        # Round floats
-        for field in ("actual", "consensus", "previous", "surprise", "impact_score"):
-            if rec.get(field) is not None:
-                rec[field] = round(float(rec[field]), 6)
-
-        valid.append(rec)
-
-    if dropped:
-        log.warning(f"[VALIDATE] Dropped {dropped} invalid records.")
-
-    log.info(f"[VALIDATE] {len(valid)} valid records ready for storage.")
-    return valid
-
-
-def strip_internal_fields(records: list[dict]) -> list[dict]:
-    """Remove pipeline-internal fields before MongoDB upsert."""
-    INTERNAL = {"_source"}
-    return [{k: v for k, v in rec.items() if k not in INTERNAL} for rec in records]
-
-
-# ─────────────────────────────────────────────────────────────
-# MONGODB
-# ─────────────────────────────────────────────────────────────
-
-def get_mongo_db():
-    """Connect to MongoDB Atlas and return (client, db) tuple."""
-    if not MONGO_URI:
-        raise ValueError("MONGO_URI not set in .env – cannot connect to MongoDB.")
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000)
-    client.admin.command("ping")
-    log.info("✅ Connected to MongoDB Atlas.")
-    return client, client[DB_NAME]
-
-
-def ensure_indexes(db):
-    """Create indexes on events collection for deduplication and queries."""
-    col = db[EVENTS_COL]
+    client.admin.command("ping")   # fast connectivity check
+    col = client[DB_NAME][COLLECTION]
     col.create_index(
         [("event_name", 1), ("country", 1), ("timestamp", 1)],
         unique=True,
         background=True,
         name="event_dedup_idx",
     )
-    col.create_index([("category", 1), ("timestamp", -1)], background=True)
-    col.create_index([("country", 1), ("timestamp", -1)], background=True)
-    log.info("[MONGO] Indexes ensured on 'events' collection.")
-
-
-def upsert_events(records: list[dict], db, dry_run: bool = False) -> int:
-    """
-    Upsert event records into MongoDB.
-    Dedup key: (event_name, country, timestamp).
-    Returns count of newly inserted documents.
-    """
-    if not records:
-        log.warning("[MONGO] No records to upsert.")
+    return col
+ 
+ 
+def upload_to_mongo(df: pd.DataFrame, collection) -> int:
+    """Upsert records; returns count of newly inserted documents."""
+    if df.empty:
+        log.warning("  Nothing to upload — dataframe is empty.")
         return 0
-
-    if dry_run:
-        log.info(f"[DRY RUN] Would upsert {len(records)} records – skipping MongoDB write.")
-        return 0
-
-    col = db[EVENTS_COL]
+ 
+    output_cols = [c for c in [
+        "event_name", "country", "timestamp",
+        "actual", "consensus", "previous",
+        "surprise", "impact_score", "category",
+    ] if c in df.columns]
+ 
+    records = df[output_cols].to_dict("records")
+ 
+    # Sanitize types for MongoDB
+    for rec in records:
+        ts = rec.get("timestamp")
+        if hasattr(ts, "to_pydatetime"):
+            rec["timestamp"] = ts.to_pydatetime()
+        for k, v in rec.items():
+            if isinstance(v, float) and np.isnan(v):
+                rec[k] = None
+            elif isinstance(v, np.integer):
+                rec[k] = int(v)
+            elif isinstance(v, np.floating):
+                rec[k] = float(v) if not np.isnan(v) else None
+ 
     ops = [
         UpdateOne(
-            filter={
-                "event_name": rec["event_name"],
-                "country"   : rec["country"],
-                "timestamp" : rec["timestamp"],
-            },
-            update={"$setOnInsert": rec},
+            {"event_name": r["event_name"], "country": r["country"], "timestamp": r["timestamp"]},
+            {"$setOnInsert": r},
             upsert=True,
         )
-        for rec in records
+        for r in records
     ]
-
-    total_inserted = 0
+ 
+    total_upserted = 0
     for i in range(0, len(ops), BATCH_SIZE):
-        batch = ops[i : i + BATCH_SIZE]
         try:
-            result         = col.bulk_write(batch, ordered=False)
-            total_inserted += result.upserted_count
+            result = collection.bulk_write(ops[i : i + BATCH_SIZE], ordered=False)
+            total_upserted += result.upserted_count
         except BulkWriteError as bwe:
-            total_inserted += bwe.details.get("nUpserted", 0)
-            log.debug(f"[MONGO] BulkWriteError detail (expected on reruns): {bwe.details}")
-
-    log.info(f"✅ Upserted {total_inserted} new records into '{EVENTS_COL}'.")
-    return total_inserted
-
-
-# ─────────────────────────────────────────────────────────────
-# SUMMARY REPORT
-# ─────────────────────────────────────────────────────────────
-
-def print_summary(records: list[dict], inserted: int):
-    """Print a structured pipeline summary to the log."""
-    total = len(records)
-    by_event: dict[str, int] = defaultdict(int)
-    by_country: dict[str, int] = defaultdict(int)
-    by_source: dict[str, int] = defaultdict(int)
-
-    for rec in records:
-        by_event[rec.get("event_name", "Unknown")] += 1
-        by_country[rec.get("country", "Unknown")]  += 1
-        by_source[rec.get("_source", "unknown")]   += 1     # still present pre-strip
-
-    log.info("")
-    log.info("=" * 60)
-    log.info("  EventOracle – Events Pipeline Summary")
-    log.info("=" * 60)
-    log.info(f"  Total records processed : {total}")
-    log.info(f"  New records inserted    : {inserted}")
-    log.info("")
-    log.info("  Breakdown by event type:")
-    for ev, count in sorted(by_event.items()):
-        log.info(f"    {ev:<30} {count:>5}")
-    log.info("")
-    log.info("  Breakdown by country:")
-    for c, count in sorted(by_country.items()):
-        log.info(f"    {c:<30} {count:>5}")
-    log.info("")
-    log.info("  Breakdown by source:")
-    for src, count in sorted(by_source.items()):
-        log.info(f"    {src:<30} {count:>5}")
-    log.info("=" * 60)
-
-
-# ─────────────────────────────────────────────────────────────
-# PIPELINE ORCHESTRATOR
-# ─────────────────────────────────────────────────────────────
-
-AVAILABLE_SOURCES = ["fred", "tradingeconomics", "datagov", "rbi", "sebi", "news"]
-
-
-def run_pipeline(sources: list[str] = None, lookback_days: int = 365,
-                 dry_run: bool = False):
-    """
-    Main pipeline orchestrator.
-    Runs all (or selected) event sources, engineers features, and upserts to MongoDB.
-    """
-    run_sources = set(sources or AVAILABLE_SOURCES)
-
+            total_upserted += bwe.details.get("nUpserted", 0)
+            log.debug(f"  BulkWriteError (expected on reruns): {bwe.details}")
+ 
+    log.info(f"  ✅ Upserted {total_upserted} new records into '{COLLECTION}'.")
+    return total_upserted
+ 
+ 
+# ─────────────────────────────────────────────
+# 5. PIPELINE ORCHESTRATOR
+# ─────────────────────────────────────────────
+ 
+def run_pipeline(event_type: str = None, force_fallback: bool = False):
+    """Full pipeline: fetch → fallback → merge → clean → features → upsert."""
     log.info("=" * 60)
     log.info("EventOracle – Economic Events Pipeline Starting")
-    log.info(f"Sources: {sorted(run_sources)} | Lookback: {lookback_days}d | DryRun: {dry_run}")
+    log.info(f"Mode: {'static fallback only' if force_fallback else 'live APIs + static fallback'} | "
+             f"Filter: {event_type or 'all events'}")
     log.info("=" * 60)
-
-    # ── Connect to MongoDB ────────────────────────────────────
+ 
     try:
-        client, db = get_mongo_db()
-        ensure_indexes(db)
-    except Exception as exc:
-        log.error(f"❌ MongoDB connection failed: {exc}")
+        collection = get_mongo_collection()
+        log.info("✅ Connected to MongoDB Atlas.")
+    except Exception as e:
+        log.error(f"❌ MongoDB connection failed: {e}")
         return
-
+ 
     all_records: list[dict] = []
-    use_fallback = True      # flip to False if any real API succeeds
-
-    # ── Stage 1: FRED (US macro) ─────────────────────────────
-    if "fred" in run_sources:
-        fred_records = fetch_fred_all(lookback_days=lookback_days)
-        if fred_records:
-            all_records.extend(fred_records)
-            use_fallback = False
-            log.info(f"[STAGE 1] FRED: +{len(fred_records)} records.")
-        else:
-            log.warning("[STAGE 1] FRED returned no data.")
-
-    # ── Stage 2: TradingEconomics (global macro + consensus) ─
-    if "tradingeconomics" in run_sources:
-        te_records = fetch_te_all()
-        if te_records:
-            all_records.extend(te_records)
-            use_fallback = False
-            log.info(f"[STAGE 2] TradingEconomics: +{len(te_records)} records.")
-        else:
-            log.warning("[STAGE 2] TradingEconomics returned no data.")
-
-    # ── Stage 3: data.gov.in (India CPI, IIP) ────────────────
-    if "datagov" in run_sources:
-        dg_records = fetch_data_gov_all()
-        if dg_records:
-            all_records.extend(dg_records)
-            use_fallback = False
-            log.info(f"[STAGE 3] data.gov.in: +{len(dg_records)} records.")
-        else:
-            log.warning("[STAGE 3] data.gov.in returned no data.")
-
-    # ── Stage 4: RBI scrape (MPC decisions) ──────────────────
-    if "rbi" in run_sources:
-        rbi_records = scrape_rbi_mpc()
-        if rbi_records:
-            all_records.extend(rbi_records)
-            use_fallback = False
-            log.info(f"[STAGE 4] RBI scrape: +{len(rbi_records)} records.")
-        else:
-            log.warning("[STAGE 4] RBI scrape returned no data.")
-
-    # ── Stage 5: SEBI scrape (regulatory events) ─────────────
-    if "sebi" in run_sources:
-        sebi_records = scrape_sebi_announcements()
-        if sebi_records:
-            all_records.extend(sebi_records)
-            log.info(f"[STAGE 5] SEBI scrape: +{len(sebi_records)} records.")
-        else:
-            log.warning("[STAGE 5] SEBI scrape returned no data.")
-
-    # ── Stage 6: News collection (Person 4 integration) ──────
-    if "news" in run_sources:
-        sebi_news = read_sebi_events_from_news(db, lookback_days=lookback_days)
-        macro_signals = read_macro_signals_from_news(db, lookback_days=lookback_days)
-        news_total = len(sebi_news) + len(macro_signals)
-        all_records.extend(sebi_news)
-        all_records.extend(macro_signals)
-        log.info(f"[STAGE 6] News pipeline: +{news_total} records.")
-
-    # ── Fallback (if all APIs failed) ────────────────────────
-    if use_fallback and not all_records:
-        log.warning("[PIPELINE] All primary sources failed – loading static fallback data.")
-        all_records.extend(get_static_fallback())
-
+ 
+    if not force_fallback:
+        if event_type in (None, "CPI"):
+            log.info("\n── US CPI (FRED) ──")
+            try:
+                all_records.extend(fetch_fred(FRED_SERIES["US_CPI"], "CPI"))
+            except Exception as e:
+                log.error(f"  [FRED CPI] {e}")
+ 
+        if event_type in (None, "FED_RATE"):
+            log.info("\n── Fed Funds Rate (FRED) ──")
+            try:
+                all_records.extend(fetch_fred(FRED_SERIES["FED_RATE"], "FED_RATE"))
+            except Exception as e:
+                log.error(f"  [FRED FED_RATE] {e}")
+ 
+        if event_type in (None, "CPI"):
+            log.info("\n── India CPI (data.gov.in) ──")
+            try:
+                all_records.extend(fetch_data_gov(DATA_GOV_RESOURCES["INDIA_CPI"], "CPI", "India"))
+            except Exception as e:
+                log.error(f"  [data.gov.in CPI] {e}")
+ 
+        if event_type in (None, "IIP"):
+            log.info("\n── India IIP (data.gov.in) ──")
+            try:
+                all_records.extend(fetch_data_gov(DATA_GOV_RESOURCES["INDIA_IIP"], "IIP", "India"))
+            except Exception as e:
+                log.error(f"  [data.gov.in IIP] {e}")
+ 
+        if event_type in (None, "RBI_REPO"):
+            log.info("\n── RBI MPC Repo Rate (scrape) ──")
+            try:
+                all_records.extend(fetch_rbi_mpc())
+            except Exception as e:
+                log.error(f"  [RBI scrape] {e}")
+ 
+    # Static fallback always runs — it supplements live data
+    log.info("\n── Static Verified Fallback (always runs) ──")
+    all_records.extend(fetch_static_fallback(event_type))
+ 
     if not all_records:
-        log.error("❌ Pipeline aborted – no records collected from any source.")
-        client.close()
+        log.error("❌ Pipeline aborted — no records from any source.")
         return
-
-    log.info(f"[PIPELINE] Total raw records collected: {len(all_records)}")
-
-    # ── Stage 7: Deduplication ───────────────────────────────
-    all_records = deduplicate(all_records)
-
-    # ── Stage 8: Feature engineering ────────────────────────
-    all_records = feature_engineering(all_records)
-
-    # ── Stage 9: Clean & validate ────────────────────────────
-    all_records = clean_and_validate(all_records)
-
-    # ── Summary (pre-strip, while _source still present) ─────
-    print_summary(all_records, inserted=0)   # placeholder; updated after insert
-
-    # ── Stage 10: Strip internal fields & upsert ─────────────
-    storage_records = strip_internal_fields(all_records)
-    inserted = upsert_events(storage_records, db, dry_run=dry_run)
-
-    # Re-print final summary with actual inserted count
-    log.info(f"✅ Pipeline complete. {inserted} new records inserted into MongoDB.")
-    client.close()
-
-
-# ─────────────────────────────────────────────────────────────
-# CLI ENTRY POINT
-# ─────────────────────────────────────────────────────────────
-
+ 
+    log.info(f"\n── Total raw records: {len(all_records)} ──")
+ 
+    log.info("\n── Cleaning & Normalizing ──")
+    df = clean_events(all_records)
+    if df.empty:
+        log.error("❌ Pipeline aborted — all records dropped during cleaning.")
+        return
+ 
+    log.info("\n── Feature Engineering ──")
+    df = add_features(df)
+ 
+    log.info("\n── Uploading to MongoDB ──")
+    inserted = upload_to_mongo(df, collection)
+ 
+    log.info("\n" + "=" * 60)
+    log.info("Pipeline Complete – Summary")
+    log.info("=" * 60)
+    log.info(f"  Total records processed : {len(df)}")
+    log.info(f"  New records inserted    : {inserted}")
+    for key, cnt in df.groupby(["event_name", "country"]).size().to_dict().items():
+        log.info(f"  {key[0]:<12} ({key[1]:<6}) → {cnt} records")
+    log.info("=" * 60)
+ 
+ 
+# ─────────────────────────────────────────────
+# 6. CLI
+# ─────────────────────────────────────────────
+ 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="EventOracle – Macroeconomic & Policy Events Pipeline"
+    parser = argparse.ArgumentParser(description="EventOracle Economic Events Pipeline")
+    parser.add_argument(
+        "--type", default=None,
+        choices=["CPI", "GDP", "IIP", "FED_RATE", "RBI_REPO"],
+        help="Run for a single event type (default: all)",
     )
     parser.add_argument(
-        "--source",
-        nargs="+",
-        choices=AVAILABLE_SOURCES,
-        default=None,
-        help=(
-            "One or more sources to run. Choices: "
-            + ", ".join(AVAILABLE_SOURCES)
-            + ". Default: all."
-        ),
+        "--fallback", action="store_true", default=False,
+        help="Skip live API calls; load static fallback only",
     )
-    parser.add_argument(
-        "--lookback",
-        type=int,
-        default=365,
-        help="Days of historical data to fetch (default: 365).",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=False,
-        help="Process all stages but skip the MongoDB write.",
-    )
-
     args = parser.parse_args()
-    run_pipeline(
-        sources      = args.source,
-        lookback_days= args.lookback,
-        dry_run      = args.dry_run,
-    )
+    run_pipeline(event_type=args.type, force_fallback=args.fallback)

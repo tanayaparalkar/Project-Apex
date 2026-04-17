@@ -19,12 +19,14 @@ Dependencies:
 """
 
 import os
+import time
 import re
 import logging
 import argparse
 from datetime import datetime, timezone, timedelta
 from collections import Counter
 
+import requests
 import feedparser
 import pandas as pd
 import pytz
@@ -53,11 +55,14 @@ log = logging.getLogger("eventoracle.news")
 # CONFIG
 # ─────────────────────────────────────────────
 
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME     = "eventoracle"
-COLLECTION  = "news"
-IST         = pytz.timezone("Asia/Kolkata")
-BATCH_SIZE  = 200
+MONGO_URI    = os.getenv("MONGO_URI")
+GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
+DB_NAME      = "eventoracle"
+COLLECTION   = "news"
+IST          = pytz.timezone("Asia/Kolkata")
+BATCH_SIZE   = 200
+MAX_RETRIES  = 3
+RETRY_DELAY  = 3
 
 RSS_SOURCES = {
     "et": {
@@ -76,16 +81,37 @@ RSS_SOURCES = {
 
 # Event tagging keywords (priority order matters — more specific first)
 EVENT_KEYWORDS: list[tuple[str, list[str]]] = [
-    ("RBI",      ["rbi", "reserve bank", "repo rate", "monetary policy", "mpc", "shaktikanta", "das"]),
-    ("Fed",      ["federal reserve", "fed rate", "fomc", "jerome powell", "fed meeting", "us rate", "rate hike", "rate cut"]),
-    ("CPI",      ["cpi", "inflation", "consumer price", "wpi", "wholesale price", "price index"]),
-    ("Oil",      ["oil", "brent", "crude", "opec", "petroleum", "fuel price"]),
-    ("FII",      ["fii", "dii", "foreign institutional", "domestic institutional", "fpi", "foreign portfolio"]),
-    ("GDP/IIP",  ["gdp", "iip", "gross domestic", "industrial production", "economic growth", "growth rate"]),
-    ("SEBI",     ["sebi", "securities board", "market regulator", "circuit breaker", "f&o ban", "insider trading"]),
+    ("RBI",          ["rbi", "reserve bank", "repo rate", "monetary policy", "mpc", "shaktikanta", "das"]),
+    ("Fed",          ["federal reserve", "fed rate", "fomc", "jerome powell", "fed meeting", "us rate", "rate hike", "rate cut"]),
+    ("CPI",          ["cpi", "inflation", "consumer price", "wpi", "wholesale price", "price index"]),
+    ("Oil",          ["oil", "brent", "crude", "opec", "petroleum", "fuel price"]),
+    ("Gold",         ["gold", "xauusd", "gold price", "gold futures", "gold etf", "yellow metal", "bullion"]),
+    ("Silver",       ["silver", "xagusd", "silver price", "silver futures"]),
+    ("Platinum",     ["platinum", "xptusd", "platinum price", "pgm"]),
+    ("Bitcoin",      ["bitcoin", "btc", "crypto", "cryptocurrency", "blockchain", "ethereum", "digital currency"]),
+    ("Nifty",        ["nifty", "sensex", "nse", "bse", "bank nifty", "banknifty", "nifty it", "nifty metal"]),
+    ("Currency",     ["rupee", "inr", "dollar", "usd", "forex", "currency", "exchange rate", "inrusd"]),
+    ("FII",          ["fii", "dii", "foreign institutional", "domestic institutional", "fpi", "foreign portfolio"]),
+    ("GDP/IIP",      ["gdp", "iip", "gross domestic", "industrial production", "economic growth", "growth rate"]),
+    ("SEBI",         ["sebi", "securities board", "market regulator", "circuit breaker", "f&o ban", "insider trading"]),
     ("Geopolitical", ["war", "sanction", "geopolit", "tension", "conflict", "tariff", "trade war", "election", "ceasefire"]),
 ]
 
+# Google News RSS search queries — covers all tracked assets
+GOOGLE_NEWS_QUERIES = [
+    # Market indices (from market_pipeline)
+    "Nifty 50", "Sensex", "Bank Nifty", "Nifty IT", "Nifty Metal",
+    # Commodities
+    "Brent crude oil", "gold price", "silver price", "platinum price",
+    # Crypto
+    "Bitcoin BTC",
+    # Currency
+    "Indian rupee USD",
+    # Macro / policy
+    "RBI monetary policy", "India inflation CPI", "India GDP growth",
+    "Federal Reserve rate decision", "FII DII India",
+    "SEBI regulation", "India stock market",
+]
 
 # ─────────────────────────────────────────────
 # 1. DATA INGESTION
@@ -151,6 +177,151 @@ def fetch_news(sources: dict = None, limit: int = None) -> pd.DataFrame:
     df = pd.DataFrame(all_articles)
     log.info(f"Total raw articles fetched: {len(df)}")
     return df
+
+
+def _http_get(url: str, params: dict = None, timeout: int = 15):
+    """GET with retry logic."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as e:
+            log.warning(f"  HTTP attempt {attempt}/{MAX_RETRIES} failed: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+    return None
+
+
+def fetch_google_news_historical(queries: list[str] = None,
+                                  start_date: str = "2024-04-15",
+                                  end_date: str = None) -> list[dict]:
+    """
+    Fetch historical news via Google News RSS (free, no API key needed).
+    Iterates month-by-month for each query to get broad coverage.
+    """
+    if queries is None:
+        queries = GOOGLE_NEWS_QUERIES
+    if end_date is None:
+        end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+    all_articles = []
+    total_queries = len(queries)
+
+    for qi, query in enumerate(queries, 1):
+        # Walk month-by-month
+        cursor = datetime(start_dt.year, start_dt.month, 1)
+        while cursor <= end_dt:
+            m_start = max(cursor, start_dt)
+            if cursor.month == 12:
+                m_end_dt = datetime(cursor.year + 1, 1, 1) - timedelta(days=1)
+            else:
+                m_end_dt = datetime(cursor.year, cursor.month + 1, 1) - timedelta(days=1)
+            m_end = min(m_end_dt, end_dt)
+
+            after_str = m_start.strftime("%Y-%m-%d")
+            before_str = m_end.strftime("%Y-%m-%d")
+
+            url = (
+                f"https://news.google.com/rss/search?"
+                f"q={requests.utils.quote(query)}+after:{after_str}+before:{before_str}"
+                f"&hl=en-IN&gl=IN&ceid=IN:en"
+            )
+
+            log.info(f"  [{qi}/{total_queries}] GoogleNews: '{query}' {after_str} → {before_str}")
+            try:
+                feed = feedparser.parse(url)
+                for entry in feed.entries:
+                    headline = (entry.get("title", "") or "").strip()
+                    if not headline:
+                        continue
+                    all_articles.append({
+                        "headline":      headline,
+                        "source":        f"GoogleNews",
+                        "published_raw": entry.get("published", ""),
+                        "link":          entry.get("link", ""),
+                    })
+            except Exception as e:
+                log.warning(f"  GoogleNews fetch error: {e}")
+
+            time.sleep(0.5)  # polite delay
+            # Advance to next month
+            if cursor.month == 12:
+                cursor = datetime(cursor.year + 1, 1, 1)
+            else:
+                cursor = datetime(cursor.year, cursor.month + 1, 1)
+
+    log.info(f"[GoogleNews] Fetched {len(all_articles)} total historical articles.")
+    return all_articles
+
+
+def fetch_gnews_historical(queries: list[str] = None,
+                            start_date: str = "2024-04-15",
+                            end_date: str = None) -> list[dict]:
+    """
+    Fetch historical news from GNews API (free tier: 100 req/day).
+    Supplements Google News with an additional source.
+    """
+    if not GNEWS_API_KEY:
+        log.warning("[GNEWS] No API key set (GNEWS_API_KEY). Skipping.")
+        return []
+    if queries is None:
+        queries = GOOGLE_NEWS_QUERIES
+    if end_date is None:
+        end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+    all_articles = []
+    cursor = datetime(start_dt.year, start_dt.month, 1)
+    rate_limited = False
+
+    while cursor <= end_dt and not rate_limited:
+        m_start = max(cursor, start_dt)
+        if cursor.month == 12:
+            m_end_dt = datetime(cursor.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            m_end_dt = datetime(cursor.year, cursor.month + 1, 1) - timedelta(days=1)
+        m_end = min(m_end_dt, end_dt)
+
+        from_str = m_start.strftime("%Y-%m-%dT00:00:00Z")
+        to_str = m_end.strftime("%Y-%m-%dT23:59:59Z")
+
+        for query in queries:
+            params = {
+                "q": query, "lang": "en", "country": "in",
+                "from": from_str, "to": to_str,
+                "max": 10, "apikey": GNEWS_API_KEY,
+            }
+            resp = _http_get("https://gnews.io/api/v4/search", params=params)
+            if resp is None:
+                # Check if we're rate-limited (all retries failed)
+                rate_limited = True
+                log.warning("[GNEWS] Rate limit hit (403). Stopping GNews fetch early.")
+                break
+            try:
+                for art in resp.json().get("articles", []):
+                    all_articles.append({
+                        "headline":      art.get("title", "").strip(),
+                        "source":        f"GNews-{art.get('source', {}).get('name', 'Unknown')}",
+                        "published_raw": art.get("publishedAt", ""),
+                        "link":          art.get("url", ""),
+                    })
+            except Exception as e:
+                log.error(f"[GNEWS] JSON parse error: {e}")
+            time.sleep(1)
+
+        if cursor.month == 12:
+            cursor = datetime(cursor.year + 1, 1, 1)
+        else:
+            cursor = datetime(cursor.year, cursor.month + 1, 1)
+
+    log.info(f"[GNEWS] Fetched {len(all_articles)} historical articles.")
+    return all_articles
 
 
 # ─────────────────────────────────────────────
@@ -401,11 +572,12 @@ def upload_to_mongo(df: pd.DataFrame, collection) -> int:
 # 7. PIPELINE ORCHESTRATOR
 # ─────────────────────────────────────────────
 
-def run_pipeline(sources: dict = None, limit: int = None):
+def run_pipeline(sources: dict = None, limit: int = None, historical: bool = False):
     """Run the full news ingestion and enrichment pipeline."""
+    mode = "historical (2024-2025)" if historical else "live RSS"
     log.info("=" * 55)
     log.info("EventOracle – News Intelligence Pipeline Starting")
-    log.info(f"Sources: {list((sources or RSS_SOURCES).keys())} | Limit: {limit or 'all'}")
+    log.info(f"Mode: {mode} | Sources: {list((sources or RSS_SOURCES).keys())} | Limit: {limit or 'all'}")
     log.info("=" * 55)
 
     try:
@@ -416,10 +588,29 @@ def run_pipeline(sources: dict = None, limit: int = None):
         return
 
     # Step 1: Fetch
-    df = fetch_news(sources=sources, limit=limit)
-    if df.empty:
+    all_raw: list[dict] = []
+
+    # Always try RSS feeds for recent news
+    df_rss = fetch_news(sources=sources, limit=limit)
+    if not df_rss.empty:
+        all_raw.extend(df_rss.to_dict("records"))
+
+    # Historical mode: Google News RSS + GNews API (no hardcoded data)
+    if historical:
+        log.info("\n── Historical: Google News RSS (primary) ──")
+        google_articles = fetch_google_news_historical()
+        all_raw.extend(google_articles)
+
+        log.info("\n── Historical: GNews API (supplementary) ──")
+        gnews_articles = fetch_gnews_historical()
+        all_raw.extend(gnews_articles)
+
+    if not all_raw:
         log.error("Pipeline aborted — no articles fetched.")
         return
+
+    df = pd.DataFrame(all_raw)
+    log.info(f"Total raw articles collected: {len(df)}")
 
     # Step 2: Clean
     df = clean_news(df)
@@ -465,7 +656,13 @@ if __name__ == "__main__":
         default=None,
         help="Max articles to fetch per source (default: all available)",
     )
+    parser.add_argument(
+        "--historical",
+        action="store_true",
+        default=False,
+        help="Fetch historical news from Apr 2024 via Google News RSS + GNews API",
+    )
     args = parser.parse_args()
 
     selected_sources = {args.source: RSS_SOURCES[args.source]} if args.source else RSS_SOURCES
-    run_pipeline(sources=selected_sources, limit=args.limit)
+    run_pipeline(sources=selected_sources, limit=args.limit, historical=args.historical)

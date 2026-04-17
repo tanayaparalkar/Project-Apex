@@ -49,6 +49,10 @@ ASSETS = {
     "NIFTYMETAL": "^CNXMETAL",
     "INRUSD":     "INR=X",
     "BRENT":      "BZ=F",
+    "GOLD":       "GC=F",
+    "SILVER":     "SI=F",
+    "PLATINUM":   "PL=F",
+    "BITCOIN":    "BTC-USD",
 }
 
 logging.basicConfig(
