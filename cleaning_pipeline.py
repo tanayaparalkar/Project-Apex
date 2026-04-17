@@ -570,7 +570,7 @@ def merge_features(
         ev_surprise_cols = [c for c in base.columns if "surprise" in c or "norm_surp" in c]
         base[ev_surprise_cols] = (
             base.sort_values("timestamp")[ev_surprise_cols]
-                .fillna(method="ffill", limit=EVENT_FFILL_LIMIT)
+                .ffill(limit=EVENT_FFILL_LIMIT)
         )
         base["event_flag"] = base["event_flag"].fillna(0).astype(int)
 

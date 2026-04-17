@@ -1,32 +1,25 @@
 """
 social_anomaly.py
-EventOracle – Social Sentiment & Anomaly Detection Pipeline (Person 8)
+EventOracle – Social Proxy & Anomaly Detection Pipeline (Person 8)
+Dependencies: P2 (News) + P3 (Market) outputs in MongoDB features collection.
 
-Reads from:
-  - "news"   collection  → sentiment proxy for #Nifty / market keywords
-  - "flows"  collection  → institutional flow features (Person 6)
-  - "prices" collection  → market OHLCV + technical features (Person 3)
+Reads from: eventoracle.features  (one doc per asset per day)
+Writes to:  eventoracle.social_anomaly
 
-Writes to:
-  - "features" collection → combined alt-data feature rows with anomaly flags
-
-Signal logic:
-  anomaly_flag == 1 AND sentiment_score <  0  →  STRONG SELL
-  anomaly_flag == 1 AND sentiment_score >  0  →  STRONG BUY
-  otherwise                                   →  HOLD
+Tasks:
+  1. Social Proxy Features  (news-based sentiment signals)
+  2. Cross-domain Anomaly Flags
+  3. Isolation Forest Anomaly Detection
+  4. Bulk upsert to MongoDB social_anomaly collection
 
 Usage:
-    python social_anomaly.py                    # Run full pipeline (last 3 days)
-    python social_anomaly.py --lookback 7       # Extend lookback window
-    python social_anomaly.py --dry-run          # Skip MongoDB write
+    python social_anomaly.py                          # All assets, all dates
+    python social_anomaly.py --asset NIFTY            # Single asset
+    python social_anomaly.py --start 2024-01-01       # From date
+    python social_anomaly.py --asset NIFTY --dry-run  # Preview, no write
 
-Scheduling (cron – daily at 8:00 AM IST / 2:30 AM UTC, after upstream pipelines):
-    30 2 * * * /usr/bin/python3 /path/to/social_anomaly.py >> /var/log/eventoracle_social.log 2>&1
-
-GitHub Actions: schedule: cron: '30 2 * * *'
-
-Dependencies:
-    pip install pymongo python-dotenv pandas numpy scikit-learn pytz
+Scheduling (cron – daily at 7:00 AM IST / 1:30 AM UTC):
+    30 1 * * * /usr/bin/python3 /path/to/social_anomaly.py >> /var/log/eventoracle.log 2>&1
 """
 
 import os
@@ -37,18 +30,44 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import pytz
+from dotenv import load_dotenv
 from pymongo import MongoClient, UpdateOne
 from pymongo.errors import BulkWriteError
-from dotenv import load_dotenv
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
 # ─────────────────────────────────────────────
-# BOOTSTRAP
+# CONFIG
 # ─────────────────────────────────────────────
 
 load_dotenv()
+
+MONGO_URI         = os.getenv("MONGO_URI")
+DB_NAME           = "eventoracle"
+SOURCE_COLLECTION = "features"
+OUT_COLLECTION    = "social_anomaly"
+IST               = timezone(timedelta(hours=5, minutes=30))
+BATCH_SIZE        = 500
+FFILL_LIMIT       = 3
+
+IF_N_ESTIMATORS   = 100
+IF_CONTAMINATION  = 0.05
+IF_RANDOM_STATE   = 42
+
+IF_FEATURES = [
+    "returns",
+    "rsi",
+    "rolling_volatility",
+    "volume_zscore",
+    "avg_sentiment",
+    "news_velocity",
+    "flow_zscore",
+]
+
+KNOWN_ASSETS = [
+    "NIFTY", "BANKNIFTY", "NIFTYIT", "NIFTYMETAL",
+    "INRUSD", "BRENT", "GOLD", "SILVER", "PLATINUM", "BITCOIN",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,681 +76,456 @@ logging.basicConfig(
 )
 log = logging.getLogger("eventoracle.social_anomaly")
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-
-MONGO_URI    = os.getenv("MONGO_URI")
-DB_NAME      = "eventoracle"
-NEWS_COL     = "news"
-FLOWS_COL    = "flows"
-PRICES_COL   = "prices"
-FEATURES_COL = "features"
-
-IST        = pytz.timezone("Asia/Kolkata")
-IST_OFFSET = timezone(timedelta(hours=5, minutes=30))
-
-# News keywords that act as a Twitter #Nifty sentiment proxy
-SENTIMENT_KEYWORDS = ["nifty", "banknifty", "bank nifty", "market", "stocks", "sensex", "nse", "bse"]
-
-# Primary asset for price/flow alignment
-PRIMARY_ASSET = "NIFTY"
-
-# IsolationForest
-CONTAMINATION      = 0.05
-RANDOM_STATE       = 42
-
-# Rolling windows
-WINDOW_3D          = 3
-WINDOW_5D          = 5
-ZSCORE_WINDOW      = 20
-
-# Feature columns fed into IsolationForest
-ANOMALY_FEATURES   = [
-    "returns",
-    "volatility",
-    "volume_zscore",
-    "total_flow",
-    "flow_zscore",
-    "sentiment_score",
-    "sentiment_volatility",
-]
-
-BATCH_SIZE = 500
-
 
 # ─────────────────────────────────────────────
-# UTILITIES
+# 1. DATA LOADING
 # ─────────────────────────────────────────────
 
-def ist_now() -> datetime:
-    return datetime.now(IST)
-
-
-def to_ist(dt: Optional[datetime]) -> Optional[datetime]:
-    """Coerce any datetime to IST-aware. Assumes UTC if naive."""
-    if dt is None:
-        return None
-    if isinstance(dt, pd.Timestamp):
-        dt = dt.to_pydatetime()
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(IST)
-
-
-def _floor_to_day(dt: datetime) -> datetime:
-    """Truncate IST-aware datetime to midnight of that day."""
-    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-# ─────────────────────────────────────────────
-# 1. FETCH DATA
-# ─────────────────────────────────────────────
-
-def fetch_news_sentiment(db, lookback_days: int = 3) -> pd.DataFrame:
-    """
-    Pull recent news documents matching market/Nifty keywords.
-    Returns DataFrame with: timestamp, sentiment_score.
-    Acts as a Twitter #Nifty sentiment proxy using the news collection.
-    """
-    log.info(f"[FETCH] News sentiment — last {lookback_days} day(s), keywords: {SENTIMENT_KEYWORDS}")
-    cutoff = ist_now() - timedelta(days=lookback_days)
-
-    try:
-        col = db[NEWS_COL]
-        keyword_regex = "|".join(SENTIMENT_KEYWORDS)
-        cursor = col.find(
-            {
-                "timestamp": {"$gte": cutoff},
-                "headline": {"$regex": keyword_regex, "$options": "i"},
-                "sentiment_score": {"$exists": True},
-            },
-            {"_id": 0, "timestamp": 1, "sentiment_score": 1, "headline": 1},
-        )
-        docs = list(cursor)
-    except Exception as exc:
-        log.error(f"[FETCH] News query failed: {exc}")
-        return pd.DataFrame()
-
-    if not docs:
-        log.warning("[FETCH] No matching news articles found in lookback window.")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(docs)
-    df["timestamp"] = pd.to_datetime(df["timestamp"]).apply(to_ist)
-    df["sentiment_score"] = pd.to_numeric(df["sentiment_score"], errors="coerce")
-    df = df.dropna(subset=["timestamp", "sentiment_score"])
-
-    log.info(f"[FETCH] News: {len(df)} articles retrieved.")
-    return df.reset_index(drop=True)
-
-
-def fetch_flows(db, lookback_days: int = 30) -> pd.DataFrame:
-    """
-    Pull recent flow records from the flows collection.
-    Returns DataFrame with: timestamp, total_flow, flow_zscore.
-    """
-    log.info(f"[FETCH] Flows — last {lookback_days} day(s).")
-    cutoff = ist_now() - timedelta(days=lookback_days)
-
-    try:
-        col = db[FLOWS_COL]
-        cursor = col.find(
-            {"timestamp": {"$gte": cutoff}},
-            {"_id": 0, "timestamp": 1, "total_flow": 1, "flow_zscore": 1},
-        )
-        docs = list(cursor)
-    except Exception as exc:
-        log.error(f"[FETCH] Flows query failed: {exc}")
-        return pd.DataFrame()
-
-    if not docs:
-        log.warning("[FETCH] No flow records found in lookback window.")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(docs)
-    df["timestamp"] = pd.to_datetime(df["timestamp"]).apply(to_ist)
-
-    # Derive total_flow if missing (fii_net + dii_net may exist instead)
-    if "total_flow" not in df.columns:
-        for candidate in ["fii_net", "net_flow", "flow"]:
-            if candidate in df.columns:
-                df["total_flow"] = pd.to_numeric(df[candidate], errors="coerce")
-                break
-        else:
-            df["total_flow"] = np.nan
-
-    df["total_flow"]  = pd.to_numeric(df.get("total_flow",  np.nan), errors="coerce")
-    df["flow_zscore"] = pd.to_numeric(df.get("flow_zscore", np.nan), errors="coerce")
-    df = df.dropna(subset=["timestamp"])
-
-    log.info(f"[FETCH] Flows: {len(df)} records retrieved.")
-    return df[["timestamp", "total_flow", "flow_zscore"]].reset_index(drop=True)
-
-
-def fetch_prices(db, lookback_days: int = 30, asset: str = PRIMARY_ASSET) -> pd.DataFrame:
-    """
-    Pull recent price records for the primary asset.
-    Returns DataFrame with: timestamp, returns, rolling_volatility, volume_zscore.
-    """
-    log.info(f"[FETCH] Prices — last {lookback_days} day(s), asset: {asset}.")
-    cutoff = ist_now() - timedelta(days=lookback_days)
-
-    try:
-        col = db[PRICES_COL]
-        cursor = col.find(
-            {"timestamp": {"$gte": cutoff}, "asset": asset},
-            {
-                "_id": 0,
-                "timestamp": 1,
-                "returns": 1,
-                "rolling_volatility": 1,
-                "volume_zscore": 1,
-                "close": 1,
-            },
-        )
-        docs = list(cursor)
-    except Exception as exc:
-        log.error(f"[FETCH] Prices query failed: {exc}")
-        return pd.DataFrame()
-
-    if not docs:
-        log.warning(f"[FETCH] No price records for {asset} in lookback window.")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(docs)
-    df["timestamp"] = pd.to_datetime(df["timestamp"]).apply(to_ist)
-
-    for col_name in ["returns", "rolling_volatility", "volume_zscore"]:
-        df[col_name] = pd.to_numeric(df.get(col_name, np.nan), errors="coerce")
-
-    df = df.dropna(subset=["timestamp"])
-    log.info(f"[FETCH] Prices: {len(df)} records retrieved.")
-    return df[["timestamp", "returns", "rolling_volatility", "volume_zscore"]].reset_index(drop=True)
-
-
-# ─────────────────────────────────────────────
-# 2. CLEAN DATA
-# ─────────────────────────────────────────────
-
-def clean_news_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate raw news articles into daily sentiment buckets (IST calendar day).
-    Output columns: date (IST day), raw_sentiment_scores (list).
-    """
-    if df.empty:
-        return df
-
-    df = df.copy()
-    df["date"] = df["timestamp"].apply(_floor_to_day)
-    df = df.dropna(subset=["sentiment_score", "date"])
-    log.info(f"[CLEAN] News: {len(df)} articles after cleaning.")
-    return df.reset_index(drop=True)
-
-
-def clean_flows_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize flow timestamps to IST day boundaries and drop duplicates."""
-    if df.empty:
-        return df
-
-    df = df.copy()
-    df["date"] = df["timestamp"].apply(_floor_to_day)
-    df = df.drop_duplicates(subset=["date"]).sort_values("date")
-    log.info(f"[CLEAN] Flows: {len(df)} records after cleaning.")
-    return df.reset_index(drop=True)
-
-
-def clean_prices_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize price timestamps to IST day boundaries and drop duplicates."""
-    if df.empty:
-        return df
-
-    df = df.copy()
-    df["date"] = df["timestamp"].apply(_floor_to_day)
-    df = df.drop_duplicates(subset=["date"]).sort_values("date")
-    log.info(f"[CLEAN] Prices: {len(df)} records after cleaning.")
-    return df.reset_index(drop=True)
-
-
-# ─────────────────────────────────────────────
-# 3. ADD FEATURES
-# ─────────────────────────────────────────────
-
-def _compute_sentiment_features(news_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate per-day sentiment features from the news DataFrame.
-
-    Returns DataFrame with columns:
-        date, avg_sentiment_score, sentiment_volatility, sentiment_trend
-    """
-    if news_df.empty:
-        return pd.DataFrame(columns=["date", "avg_sentiment_score", "sentiment_volatility", "sentiment_trend"])
-
-    agg = (
-        news_df.groupby("date")["sentiment_score"]
-        .agg(
-            avg_sentiment_score="mean",
-            sentiment_volatility="std",
-        )
-        .reset_index()
-    )
-
-    agg["sentiment_volatility"] = agg["sentiment_volatility"].fillna(0.0)
-
-    # Sentiment trend: rolling mean change over WINDOW_3D
-    agg = agg.sort_values("date")
-    rolling_mean = agg["avg_sentiment_score"].rolling(WINDOW_3D, min_periods=1).mean()
-    agg["sentiment_trend"] = rolling_mean.diff().fillna(0.0)
-
-    agg = agg.rename(columns={"avg_sentiment_score": "sentiment_score"})
-    agg["sentiment_score"]     = agg["sentiment_score"].round(6)
-    agg["sentiment_volatility"] = agg["sentiment_volatility"].round(6)
-    agg["sentiment_trend"]     = agg["sentiment_trend"].round(6)
-
-    log.info(f"[FEATURES] Sentiment computed for {len(agg)} days.")
-    return agg.reset_index(drop=True)
-
-
-def add_features(
-    news_df: pd.DataFrame,
-    flows_df: pd.DataFrame,
-    prices_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Merge sentiment, flow, and price features into a single DataFrame.
-
-    Output columns:
-        timestamp, returns, volatility, volume_zscore,
-        total_flow, flow_zscore,
-        sentiment_score, sentiment_volatility, sentiment_trend
-    """
-    log.info("[FEATURES] Building combined feature frame…")
-
-    # ── Sentiment features ───────────────────────────────────
-    sentiment_df = _compute_sentiment_features(news_df)
-
-    # ── Prices baseline ──────────────────────────────────────
-    if prices_df.empty:
-        log.warning("[FEATURES] Prices DataFrame is empty — using sentiment-only frame.")
-        base = sentiment_df.rename(columns={"date": "timestamp"})
-        base["returns"]       = np.nan
-        base["volatility"]    = np.nan
-        base["volume_zscore"] = np.nan
-    else:
-        base = prices_df.rename(columns={
-            "rolling_volatility": "volatility",
-            "date": "timestamp",
-        })[["timestamp", "returns", "volatility", "volume_zscore"]]
-
-    # ── Merge flows ──────────────────────────────────────────
-    if not flows_df.empty:
-        flows_keyed = flows_df.rename(columns={"date": "timestamp"})[
-            ["timestamp", "total_flow", "flow_zscore"]
-        ]
-        base = base.merge(flows_keyed, on="timestamp", how="left")
-    else:
-        log.warning("[FEATURES] Flows DataFrame is empty — filling with NaN.")
-        base["total_flow"]  = np.nan
-        base["flow_zscore"] = np.nan
-
-    # ── Merge sentiment ──────────────────────────────────────
-    if not sentiment_df.empty:
-        sent_keyed = sentiment_df.rename(columns={"date": "timestamp"})[
-            ["timestamp", "sentiment_score", "sentiment_volatility", "sentiment_trend"]
-        ]
-        base = base.merge(sent_keyed, on="timestamp", how="left")
-    else:
-        log.warning("[FEATURES] Sentiment DataFrame is empty — filling with 0.0.")
-        base["sentiment_score"]      = 0.0
-        base["sentiment_volatility"] = 0.0
-        base["sentiment_trend"]      = 0.0
-
-    # ── Fill remaining NaNs ──────────────────────────────────
-    base["sentiment_score"]      = base["sentiment_score"].fillna(0.0)
-    base["sentiment_volatility"] = base["sentiment_volatility"].fillna(0.0)
-    base["sentiment_trend"]      = base["sentiment_trend"].fillna(0.0)
-
-    # ── Rolling enrichment on merged frame ──────────────────
-    base = base.sort_values("timestamp").reset_index(drop=True)
-
-    # 5-day rolling flow z-score recompute if sparse
-    if "flow_zscore" in base.columns:
-        fz_null = base["flow_zscore"].isna().sum()
-        if fz_null > 0 and "total_flow" in base.columns:
-            roll_mean = base["total_flow"].rolling(ZSCORE_WINDOW, min_periods=1).mean()
-            roll_std  = base["total_flow"].rolling(ZSCORE_WINDOW, min_periods=1).std().replace(0, np.nan)
-            derived   = ((base["total_flow"] - roll_mean) / roll_std).round(6)
-            base["flow_zscore"] = base["flow_zscore"].fillna(derived)
-
-    base = base.drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
-
-    log.info(f"[FEATURES] Combined frame shape: {base.shape}")
-    log.info(f"[FEATURES] Columns: {list(base.columns)}")
-    return base
-
-
-# ─────────────────────────────────────────────
-# 4. ANOMALY DETECTION
-# ─────────────────────────────────────────────
-
-def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply IsolationForest on the ANOMALY_FEATURES columns.
-
-    Adds:
-        anomaly_flag  (int)   : 1 = anomaly, 0 = normal
-        anomaly_score (float) : raw decision_function output (higher = more normal)
-        combined_signal (str) : STRONG BUY / STRONG SELL / HOLD
-    """
-    if df.empty:
-        log.warning("[ANOMALY] Empty DataFrame — skipping anomaly detection.")
-        df["anomaly_flag"]    = 0
-        df["anomaly_score"]   = np.nan
-        df["combined_signal"] = "HOLD"
-        return df
-
-    df = df.copy()
-
-    # Select only available feature columns
-    available = [f for f in ANOMALY_FEATURES if f in df.columns]
-    missing   = [f for f in ANOMALY_FEATURES if f not in df.columns]
-    if missing:
-        log.warning(f"[ANOMALY] Missing features (will be excluded): {missing}")
-
-    if not available:
-        log.error("[ANOMALY] No feature columns available — aborting anomaly detection.")
-        df["anomaly_flag"]    = 0
-        df["anomaly_score"]   = np.nan
-        df["combined_signal"] = "HOLD"
-        return df
-
-    # Build feature matrix — fill residual NaNs with column median
-    X = df[available].copy()
-    for col in X.columns:
-        median = X[col].median()
-        X[col] = X[col].fillna(median if not np.isnan(median) else 0.0)
-
-    if len(X) < 2:
-        log.warning("[ANOMALY] Too few rows for IsolationForest — defaulting to HOLD.")
-        df["anomaly_flag"]    = 0
-        df["anomaly_score"]   = np.nan
-        df["combined_signal"] = "HOLD"
-        return df
-
-    # Standardise
-    scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # Fit IsolationForest
-    clf = IsolationForest(
-        contamination=CONTAMINATION,
-        random_state=RANDOM_STATE,
-        n_estimators=100,
-    )
-    clf.fit(X_scaled)
-
-    raw_preds  = clf.predict(X_scaled)           # -1 = anomaly, 1 = normal
-    raw_scores = clf.decision_function(X_scaled)  # higher = more normal
-
-    df["anomaly_flag"]  = np.where(raw_preds == -1, 1, 0).astype(int)
-    df["anomaly_score"] = raw_scores.round(6)
-
-    n_anomalies = int(df["anomaly_flag"].sum())
-    log.info(
-        f"[ANOMALY] IsolationForest complete. "
-        f"Anomalies: {n_anomalies}/{len(df)} "
-        f"({n_anomalies / len(df) * 100:.1f}%)"
-    )
-
-    # ── Combined signal ──────────────────────────────────────
-    def _signal(row) -> str:
-        if row["anomaly_flag"] == 1 and row["sentiment_score"] < 0:
-            return "STRONG SELL"
-        elif row["anomaly_flag"] == 1 and row["sentiment_score"] > 0:
-            return "STRONG BUY"
-        return "HOLD"
-
-    sentiment_col = "sentiment_score" if "sentiment_score" in df.columns else None
-    if sentiment_col:
-        df["combined_signal"] = df.apply(_signal, axis=1)
-    else:
-        df["combined_signal"] = np.where(df["anomaly_flag"] == 1, "ANOMALY", "HOLD")
-
-    signal_dist = df["combined_signal"].value_counts().to_dict()
-    log.info(f"[ANOMALY] Signal distribution: {signal_dist}")
-
-    return df.reset_index(drop=True)
-
-
-# ─────────────────────────────────────────────
-# 5. DATABASE STORAGE
-# ─────────────────────────────────────────────
-
-def get_mongo_db():
-    """Connect to MongoDB Atlas and return (client, db) tuple."""
+def get_mongo_client() -> MongoClient:
     if not MONGO_URI:
-        raise ValueError(
-            "MONGO_URI is not set. Add it to your .env file: MONGO_URI=mongodb+srv://..."
-        )
+        raise ValueError("MONGO_URI not set in environment variables.")
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000)
     client.admin.command("ping")
-    db = client[DB_NAME]
-    return client, db
+    return client
 
 
-def ensure_indexes(db) -> None:
-    """Create compound unique index on (timestamp, feature_source)."""
-    col = db[FEATURES_COL]
-    col.create_index(
-        [("timestamp", 1), ("feature_source", 1)],
-        unique=True,
-        background=True,
-        name="timestamp_source_unique",
-    )
-    log.info(f"[MONGO] Indexes ensured on '{FEATURES_COL}'.")
+def load_features(
+    client: MongoClient,
+    asset: Optional[str] = None,
+    start: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Load feature rows from MongoDB with optional asset/date filters."""
+    col = client[DB_NAME][SOURCE_COLLECTION]
 
+    query: dict = {}
+    if asset:
+        query["asset"] = asset
+    if start:
+        query["timestamp"] = {"$gte": start}
 
-def upload_to_mongo(df: pd.DataFrame, db, dry_run: bool = False) -> int:
-    """
-    Upsert feature records into the 'features' MongoDB collection.
-    Uses $setOnInsert to avoid overwriting existing records on reruns.
-    Returns count of newly inserted documents.
-    """
+    projection = {
+        "_id": 0,
+        "timestamp": 1,
+        "asset": 1,
+        # Price features
+        "returns": 1,
+        "rsi": 1,
+        "rolling_volatility": 1,
+        "volume_zscore": 1,
+        # News features
+        "avg_sentiment": 1,
+        "news_volume": 1,
+        "news_velocity": 1,
+        "news_spike_flag": 1,
+        # Flow features
+        "flow_zscore": 1,
+    }
+
+    cursor = col.find(query, projection)
+    df = pd.DataFrame(list(cursor))
+
     if df.empty:
-        log.warning("[MONGO] Nothing to upload — DataFrame is empty.")
-        return 0
+        log.warning("No documents returned from features collection.")
+        return df
 
-    OUTPUT_COLS = [
-        "timestamp",
-        "sentiment_score",
-        "sentiment_volatility",
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(IST)
+    df = df.sort_values(["asset", "timestamp"]).reset_index(drop=True)
+
+    log.info(f"Loaded {len(df)} rows from '{SOURCE_COLLECTION}' "
+             f"({df['asset'].nunique()} assets).")
+    return df
+
+
+# ─────────────────────────────────────────────
+# 2. CLEANING & IMPUTATION
+# ─────────────────────────────────────────────
+
+def clean_and_impute(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-asset forward-fill (max 3 periods) then drop remaining nulls
+    in columns required for downstream computation.
+    """
+    numeric_cols = [
+        "returns", "rsi", "rolling_volatility", "volume_zscore",
+        "avg_sentiment", "news_volume", "news_velocity", "news_spike_flag",
         "flow_zscore",
-        "volume_zscore",
-        "returns",
-        "anomaly_flag",
-        "anomaly_score",
-        "combined_signal",
-        "feature_source",
-        # Bonus extras stored for downstream consumers
-        "volatility",
-        "total_flow",
-        "sentiment_trend",
     ]
 
-    df = df.copy()
-    df["feature_source"] = "social_anomaly"
+    # Ensure all expected columns exist (fill with NaN if absent)
+    for col in numeric_cols:
+        if col not in df.columns:
+            log.warning(f"Column '{col}' missing from features – filling with NaN.")
+            df[col] = np.nan
 
-    # Keep only columns that exist in the frame
-    cols_to_store = [c for c in OUTPUT_COLS if c in df.columns]
-    records = df[cols_to_store].to_dict("records")
+    df = df.sort_values(["asset", "timestamp"])
 
+    # Per-asset ffill
+    df[numeric_cols] = (
+        df.groupby("asset", group_keys=False)[numeric_cols]
+        .apply(lambda g: g.ffill(limit=FFILL_LIMIT))
+    )
+
+    before = len(df)
+    # Only drop if the Isolation Forest features are all null
+    df = df.dropna(subset=["returns", "avg_sentiment"])
+    after = len(df)
+    if before != after:
+        log.info(f"Dropped {before - after} rows with unresolvable nulls.")
+
+    df = df.drop_duplicates(subset=["timestamp", "asset"])
+    return df.reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────
+# 3. SOCIAL PROXY FEATURES
+# ─────────────────────────────────────────────
+
+def _zscore_series(s: pd.Series) -> pd.Series:
+    """Rolling z-score over the entire series (uses mean/std of available data)."""
+    mean = s.expanding(min_periods=5).mean()
+    std  = s.expanding(min_periods=5).std().replace(0, np.nan)
+    return (s - mean) / std
+
+
+def compute_social_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-asset computation of social proxy signals:
+      - social_sentiment_score
+      - social_buzz_intensity
+      - sentiment_momentum   (avg_sentiment - 3-day lag)
+      - sentiment_volatility (5-day rolling std of avg_sentiment)
+    """
+    result_parts = []
+
+    for asset, grp in df.groupby("asset"):
+        grp = grp.sort_values("timestamp").copy()
+
+        z_velocity = _zscore_series(grp["news_velocity"].fillna(0))
+        z_volume   = _zscore_series(grp["news_volume"].fillna(0))
+
+        grp["social_sentiment_score"] = (
+            0.5 * grp["avg_sentiment"].fillna(0)
+            + 0.3 * z_velocity.fillna(0)
+            + 0.2 * z_volume.fillna(0)
+        ).round(6)
+
+        grp["social_buzz_intensity"] = z_volume.round(6)
+
+        grp["sentiment_momentum"] = (
+            grp["avg_sentiment"] - grp["avg_sentiment"].shift(3)
+        ).round(6)
+
+        grp["sentiment_volatility"] = (
+            grp["avg_sentiment"].rolling(5, min_periods=2).std()
+        ).round(6)
+
+        result_parts.append(grp)
+
+    return pd.concat(result_parts, ignore_index=True)
+
+
+# ─────────────────────────────────────────────
+# 4. CROSS-DOMAIN ANOMALY FLAGS
+# ─────────────────────────────────────────────
+
+def compute_cross_domain_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-asset rolling signals:
+      - flow_anomaly_flag   : |flow_zscore| > 2
+      - price_anomaly_flag  : |returns| > 2σ (rolling 10)
+      - market_stress_score : sum of the three binary flags
+      - composite_anomaly_flag : market_stress_score >= 2
+    """
+    result_parts = []
+
+    for asset, grp in df.groupby("asset"):
+        grp = grp.sort_values("timestamp").copy()
+
+        flow_z = grp["flow_zscore"].fillna(0)
+        grp["flow_anomaly_flag"] = (flow_z.abs() > 2).astype(int)
+
+        ret = grp["returns"].fillna(0)
+        roll_std = ret.rolling(10, min_periods=3).std().replace(0, np.nan)
+        grp["price_anomaly_flag"] = (ret.abs() > 2 * roll_std).astype(int)
+
+        news_spike = grp["news_spike_flag"].fillna(0).astype(int)
+
+        grp["market_stress_score"] = (
+            news_spike
+            + grp["flow_anomaly_flag"]
+            + grp["price_anomaly_flag"]
+        )
+
+        result_parts.append(grp)
+
+    return pd.concat(result_parts, ignore_index=True)
+
+
+# ─────────────────────────────────────────────
+# 5. ISOLATION FOREST ANOMALY DETECTION
+# ─────────────────────────────────────────────
+
+def compute_isolation_forest(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fit Isolation Forest per asset on IF_FEATURES.
+    Outputs:
+      anomaly_score  : raw decision function (higher = more normal)
+      anomaly_flag   : 1 if anomaly, 0 if normal
+    """
+    result_parts = []
+
+    for asset, grp in df.groupby("asset"):
+        grp = grp.sort_values("timestamp").copy()
+        grp["anomaly_score"] = np.nan
+        grp["anomaly_flag"]  = 0
+
+        available_features = [f for f in IF_FEATURES if f in grp.columns]
+        feature_df = grp[available_features].copy()
+
+        # Rows where all IF features are present
+        valid_mask = feature_df.notna().all(axis=1)
+        n_valid = valid_mask.sum()
+
+        if n_valid < 20:
+            log.warning(
+                f"[{asset}] Only {n_valid} complete rows for IF – skipping anomaly detection."
+            )
+            result_parts.append(grp)
+            continue
+
+        X = feature_df.loc[valid_mask].values
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        iso = IsolationForest(
+            n_estimators=IF_N_ESTIMATORS,
+            contamination=IF_CONTAMINATION,
+            random_state=IF_RANDOM_STATE,
+            n_jobs=-1,
+        )
+        iso.fit(X_scaled)
+
+        scores = iso.decision_function(X_scaled)   # higher = more normal
+        preds  = iso.predict(X_scaled)              # -1 = anomaly, 1 = normal
+
+        grp.loc[valid_mask, "anomaly_score"] = np.round(scores, 6)
+        grp.loc[valid_mask, "anomaly_flag"]  = (preds == -1).astype(int)
+
+        n_anomalies = (preds == -1).sum()
+        log.info(f"[{asset}] Isolation Forest: {n_anomalies}/{n_valid} anomalies detected.")
+
+        result_parts.append(grp)
+
+    return pd.concat(result_parts, ignore_index=True)
+
+
+# ─────────────────────────────────────────────
+# 6. COMPOSITE FLAG & FINAL SCHEMA
+# ─────────────────────────────────────────────
+
+OUTPUT_FIELDS = [
+    "timestamp", "asset",
+    "social_sentiment_score", "social_buzz_intensity",
+    "sentiment_momentum", "sentiment_volatility",
+    "anomaly_score", "anomaly_flag",
+    "market_stress_score", "composite_anomaly_flag",
+]
+
+
+def build_output(df: pd.DataFrame) -> pd.DataFrame:
+    """Assemble final output schema and compute composite_anomaly_flag."""
+    df["composite_anomaly_flag"] = (df["market_stress_score"] >= 2).astype(int)
+
+    # Ensure all output fields exist
+    for field in OUTPUT_FIELDS:
+        if field not in df.columns:
+            df[field] = np.nan
+
+    out = df[OUTPUT_FIELDS].copy()
+    out = out.drop_duplicates(subset=["timestamp", "asset"])
+    return out.reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────
+# 7. DATABASE STORAGE
+# ─────────────────────────────────────────────
+
+def get_output_collection(client: MongoClient):
+    col = client[DB_NAME][OUT_COLLECTION]
+    col.create_index(
+        [("timestamp", 1), ("asset", 1)],
+        unique=True,
+        background=True,
+        name="timestamp_asset_unique",
+    )
+    return col
+
+
+def upload_to_mongo(df: pd.DataFrame, collection, dry_run: bool = False) -> int:
+    """Bulk upsert records into MongoDB. Returns count of upserted docs."""
+    if df.empty:
+        log.warning("Nothing to upload – output dataframe is empty.")
+        return 0
+
+    records = df.to_dict("records")
+
+    # Coerce types for MongoDB
     for rec in records:
-        # Serialize timestamps
         ts = rec.get("timestamp")
         if hasattr(ts, "to_pydatetime"):
             rec["timestamp"] = ts.to_pydatetime()
-        elif isinstance(ts, datetime) and ts.tzinfo is None:
-            rec["timestamp"] = ts.replace(tzinfo=IST_OFFSET)
-
-        # Replace NaN → None for clean BSON
         for k, v in rec.items():
             if isinstance(v, float) and np.isnan(v):
                 rec[k] = None
             elif isinstance(v, (np.integer,)):
                 rec[k] = int(v)
             elif isinstance(v, (np.floating,)):
-                rec[k] = float(v)
-            elif isinstance(v, (np.bool_,)):
-                rec[k] = bool(v)
-
-    if dry_run:
-        log.info(f"[MONGO] DRY RUN — would upsert {len(records)} records into '{FEATURES_COL}'.")
-        return 0
+                rec[k] = float(v) if not np.isnan(v) else None
 
     ops = [
         UpdateOne(
-            {"timestamp": rec["timestamp"], "feature_source": rec["feature_source"]},
-            {"$setOnInsert": rec},
+            {"timestamp": rec["timestamp"], "asset": rec["asset"]},
+            {"$set": rec},
             upsert=True,
         )
         for rec in records
     ]
 
-    total_upserted = 0
-    collection = db[FEATURES_COL]
+    if dry_run:
+        log.info(f"[DRY RUN] Would upsert {len(ops)} records into '{OUT_COLLECTION}'.")
+        return 0
 
+    total_upserted = 0
     for i in range(0, len(ops), BATCH_SIZE):
         batch = ops[i : i + BATCH_SIZE]
         try:
             result = collection.bulk_write(batch, ordered=False)
-            total_upserted += result.upserted_count
+            total_upserted += result.upserted_count + result.modified_count
         except BulkWriteError as bwe:
             total_upserted += bwe.details.get("nUpserted", 0)
-            log.debug(f"[MONGO] BulkWriteError (expected on reruns): {bwe.details}")
+            log.debug(f"BulkWriteError details: {bwe.details}")
 
-    log.info(f"[MONGO] ✅ Upserted {total_upserted} new records into '{FEATURES_COL}'.")
+    log.info(f"✅ Upserted/updated {total_upserted} records into '{OUT_COLLECTION}'.")
     return total_upserted
 
 
 # ─────────────────────────────────────────────
-# 6. PIPELINE ORCHESTRATOR
+# 8. PIPELINE ORCHESTRATOR
 # ─────────────────────────────────────────────
 
-def run_pipeline(lookback_days: int = 3, dry_run: bool = False) -> None:
-    """
-    Full social anomaly pipeline:
-        fetch → clean → add_features → detect_anomalies → upload
-    """
+def run_pipeline(
+    asset: Optional[str] = None,
+    start: Optional[str] = None,
+    dry_run: bool = False,
+):
     log.info("=" * 60)
-    log.info("EventOracle – Social Sentiment & Anomaly Pipeline Starting")
-    log.info(f"Lookback: {lookback_days}d | DryRun: {dry_run}")
+    log.info("EventOracle – Social & Anomaly Pipeline Starting")
+    log.info(f"  Asset   : {asset or 'ALL'}")
+    log.info(f"  Start   : {start or 'ALL TIME'}")
+    log.info(f"  Dry Run : {dry_run}")
     log.info("=" * 60)
 
-    # ── Connect ─────────────────────────────────────────────
+    # Parse start date
+    start_dt: Optional[datetime] = None
+    if start:
+        try:
+            start_dt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+        except ValueError:
+            log.error(f"Invalid --start date format '{start}'. Use YYYY-MM-DD.")
+            return
+
     try:
-        client, db = get_mongo_db()
-        ensure_indexes(db)
+        client = get_mongo_client()
         log.info("✅ Connected to MongoDB Atlas.")
-    except Exception as exc:
-        log.error(f"❌ MongoDB connection failed: {exc}")
+    except Exception as e:
+        log.error(f"❌ MongoDB connection failed: {e}")
         return
 
-    # Use a wider lookback for market data so rolling windows have signal
-    market_lookback = max(lookback_days + ZSCORE_WINDOW, 30)
-
+    # ── Step 1: Load ──
     try:
-        # ── Stage 1: Fetch ───────────────────────────────────
-        log.info("\n── Stage 1: Fetching data from upstream collections ──")
-        raw_news   = fetch_news_sentiment(db, lookback_days=lookback_days)
-        raw_flows  = fetch_flows(db,  lookback_days=market_lookback)
-        raw_prices = fetch_prices(db, lookback_days=market_lookback, asset=PRIMARY_ASSET)
+        raw_df = load_features(client, asset=asset, start=start_dt)
+    except Exception as e:
+        log.error(f"Failed to load features: {e}", exc_info=True)
+        return
 
-        all_empty = raw_news.empty and raw_flows.empty and raw_prices.empty
-        if all_empty:
-            log.error("❌ All upstream data sources returned empty. Pipeline aborted.")
-            client.close()
-            return
+    if raw_df.empty:
+        log.warning("No data to process. Exiting.")
+        return
 
-        # ── Stage 2: Clean ───────────────────────────────────
-        log.info("\n── Stage 2: Cleaning data ──")
-        clean_news_data   = clean_news_df(raw_news)
-        clean_flows_data  = clean_flows_df(raw_flows)
-        clean_prices_data = clean_prices_df(raw_prices)
+    # ── Step 2: Clean ──
+    log.info("Cleaning and imputing data...")
+    df = clean_and_impute(raw_df)
+    if df.empty:
+        log.warning("All rows dropped after cleaning. Exiting.")
+        return
 
-        # ── Stage 3: Feature Engineering ─────────────────────
-        log.info("\n── Stage 3: Engineering features ──")
-        featured_df = add_features(
-            news_df=clean_news_data,
-            flows_df=clean_flows_data,
-            prices_df=clean_prices_data,
-        )
+    # ── Step 3: Social Features ──
+    log.info("Computing social proxy features...")
+    df = compute_social_features(df)
 
-        if featured_df.empty:
-            log.error("❌ Feature engineering returned empty DataFrame. Pipeline aborted.")
-            client.close()
-            return
+    # ── Step 4: Cross-domain Flags ──
+    log.info("Computing cross-domain anomaly flags...")
+    df = compute_cross_domain_flags(df)
 
-        # ── Stage 4: Anomaly Detection ───────────────────────
-        log.info("\n── Stage 4: Detecting anomalies ──")
-        result_df = detect_anomalies(featured_df)
+    # ── Step 5: Isolation Forest ──
+    log.info("Running Isolation Forest anomaly detection...")
+    df = compute_isolation_forest(df)
 
-        # ── Stage 5: Upload ──────────────────────────────────
-        log.info("\n── Stage 5: Uploading to MongoDB ──")
-        inserted = upload_to_mongo(result_df, db, dry_run=dry_run)
+    # ── Step 6: Final Schema ──
+    output_df = build_output(df)
+    log.info(f"Output shape: {output_df.shape}")
 
-        # ── Summary ──────────────────────────────────────────
-        log.info("")
-        log.info("=" * 60)
-        log.info("  EventOracle – Social Anomaly Pipeline Summary")
-        log.info("=" * 60)
-        log.info(f"  Feature rows produced    : {len(result_df)}")
-        log.info(f"  New records inserted      : {inserted}")
-        log.info(f"  Anomalies detected        : {int(result_df['anomaly_flag'].sum())}")
+    if dry_run:
+        log.info("\n── DRY RUN PREVIEW (first 10 rows) ──")
+        with pd.option_context("display.max_columns", None, "display.width", 200):
+            log.info("\n" + output_df.head(10).to_string(index=False))
 
-        if "combined_signal" in result_df.columns:
-            signal_counts = result_df["combined_signal"].value_counts().to_dict()
-            for sig, cnt in signal_counts.items():
-                log.info(f"  Signal [{sig:<12}]  : {cnt}")
+    # ── Step 7: Upload ──
+    try:
+        col = get_output_collection(client)
+        upload_to_mongo(output_df, col, dry_run=dry_run)
+    except Exception as e:
+        log.error(f"Upload failed: {e}", exc_info=True)
+        return
 
-        if not result_df.empty and "timestamp" in result_df.columns:
-            ts_min = result_df["timestamp"].min()
-            ts_max = result_df["timestamp"].max()
-            if hasattr(ts_min, "date"):
-                log.info(f"  Date range               : {ts_min.date()} → {ts_max.date()}")
-
-        log.info("=" * 60)
-
-    except Exception as exc:
-        log.error(f"❌ Unexpected pipeline error: {exc}", exc_info=True)
-    finally:
-        client.close()
-        log.info("✅ Social anomaly pipeline complete.")
+    log.info("=" * 60)
+    log.info("Pipeline Complete.")
+    log.info("=" * 60)
 
 
 # ─────────────────────────────────────────────
-# 7. CLI ENTRY POINT
+# 9. CLI ENTRY POINT
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="EventOracle – Social Sentiment & Anomaly Detection Pipeline"
+        description="EventOracle Social Proxy & Anomaly Detection Pipeline (P8)"
     )
     parser.add_argument(
-        "--lookback",
-        type=int,
-        default=3,
-        help="Days of news to use for sentiment window (default: 3). "
-             "Market data uses a wider auto-extended window.",
+        "--asset",
+        type=str,
+        default=None,
+        choices=KNOWN_ASSETS,
+        help="Run for a single asset (default: all assets)",
+    )
+    parser.add_argument(
+        "--start",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Process only rows on or after this date (UTC)",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
-        help="Process all stages but skip the MongoDB write.",
+        help="Compute features but do NOT write to MongoDB",
     )
     args = parser.parse_args()
 
     run_pipeline(
-        lookback_days=args.lookback,
+        asset=args.asset,
+        start=args.start,
         dry_run=args.dry_run,
     )
