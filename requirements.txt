@@ -29,3 +29,7 @@ pytz>=2024.1
 
 # Generative AI Agent
 google-genai>=0.3.0
+
+gunicorn>=21.2.0
+flask>=3.0.0
+flask-cors>=4.0.0
