@@ -4,7 +4,10 @@
  * Maps 1:1 with the MongoDB collections served by the backend.
  */
 
-const API_BASE = "http://localhost:5000/api";
+const API_BASE =
+  import.meta.env.MODE === "development"
+    ? "http://localhost:5000"
+    : "https://project-apex-baip.onrender.com";
 
 async function fetchJSON(url) {
   const res = await fetch(url);
