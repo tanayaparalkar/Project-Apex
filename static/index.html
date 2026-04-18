@@ -392,10 +392,10 @@ const API_CONFIGS = {
 function detectAPIBase() {
   const h = window.location.hostname;
   if (h === "localhost" || h === "127.0.0.1") return API_CONFIGS.local;
-  return API_CONFIGS.sameOrigin;
+  if (h === "34.180.15.52") return API_CONFIGS.sameOrigin;  // served by Flask directly
+  return API_CONFIGS.vpc;  // Netlify or any external host → call VPC backend
 }
 let API_BASE = detectAPIBase();
-// Override: API_BASE = API_CONFIGS.vpc;
 
 const ASSETS = [
   { name:"NIFTY",     icon:"📈" }, { name:"BANKNIFTY", icon:"🏦" },

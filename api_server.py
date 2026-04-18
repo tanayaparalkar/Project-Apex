@@ -59,7 +59,12 @@ app = Flask(
     static_folder=str(STATIC_DIR),
     static_url_path="",
 )
-CORS(app)
+CORS(app, origins=[
+    "http://localhost:*",
+    "http://127.0.0.1:*",
+    "https://*.netlify.app",   # Netlify frontend
+    "http://34.180.15.52:*",   # VPC self-serve
+])
 
 KNOWN_ASSETS = [
     "NIFTY", "BANKNIFTY", "NIFTYIT", "NIFTYMETAL",
