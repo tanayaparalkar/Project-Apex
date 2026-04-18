@@ -210,4 +210,3 @@ __marimo__/
 
 # Frontend (React / Vite)
 node_modules/
-frontend/dist/
