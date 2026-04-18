@@ -62,8 +62,9 @@ app = Flask(
 CORS(app, origins=[
     "http://localhost:*",
     "http://127.0.0.1:*",
-    "https://*.netlify.app",   # Netlify frontend
-    "http://34.180.15.52:*",   # VPC self-serve
+    "https://lucky-belekoy-0f75e8.netlify.app",  # Netlify frontend
+    "https://*.netlify.app",
+    "http://34.180.15.52:*",
 ])
 
 KNOWN_ASSETS = [
