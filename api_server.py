@@ -51,12 +51,12 @@ MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME   = "eventoracle"
 IST       = timezone(timedelta(hours=5, minutes=30))
 
-# Path to the React build output (npm run build → frontend/dist/)
-FRONTEND_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
+# Path to front-end static files (plain HTML/CSS/JS — no build step)
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = Flask(
     __name__,
-    static_folder=str(FRONTEND_DIR),
+    static_folder=str(STATIC_DIR),
     static_url_path="",
 )
 CORS(app)
@@ -393,11 +393,10 @@ def get_asset_summary(asset: str):
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_spa(path):
-    """Serve the React SPA. API routes take precedence (registered above)."""
-    if path and (FRONTEND_DIR / path).is_file():
-        return send_from_directory(str(FRONTEND_DIR), path)
-    # For any other route, serve index.html (React handles client-side routing)
-    return send_from_directory(str(FRONTEND_DIR), "index.html")
+    """Serve the static frontend. API routes take precedence (registered above)."""
+    if path and (STATIC_DIR / path).is_file():
+        return send_from_directory(str(STATIC_DIR), path)
+    return send_from_directory(str(STATIC_DIR), "index.html")
 
 
 # ─────────────────────────────────────────────

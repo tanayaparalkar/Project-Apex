@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="EventOracle – AI-powered market intelligence dashboard with ML predictions, sentiment analysis, and LLM-driven insights for NIFTY, BANKNIFTY, Gold, Bitcoin and more." />
+  <meta name="theme-color" content="#06080d" />
+  <title>EventOracle – Market Intelligence Dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ───── Header ───── -->
+  <header class="app-header" id="app-header">
+    <div class="header-inner">
+      <div class="logo">
+        <div class="logo-icon">⚡</div>
+        <div class="logo-text"><span>EventOracle</span></div>
+      </div>
+      <div class="header-status">
+        <div class="status-dot"></div>
+        <span>Live Dashboard</span>
+        <span class="sep">|</span>
+        <span class="header-date" id="header-date"></span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ───── Main ───── -->
+  <main class="main-content" id="main">
+
+    <!-- Asset Selector -->
+    <nav class="asset-bar" id="asset-bar"></nav>
+
+    <!-- Stat Cards -->
+    <section class="stat-grid" id="stat-grid">
+      <div class="stat-card blue" id="stat-price">
+        <div class="stat-label">Close Price</div>
+        <div class="stat-value neutral" id="stat-price-val">—</div>
+        <div class="stat-sub" id="stat-price-sub">—</div>
+      </div>
+      <div class="stat-card green" id="stat-returns">
+        <div class="stat-label">Daily Returns</div>
+        <div class="stat-value neutral" id="stat-returns-val">—</div>
+        <div class="stat-sub" id="stat-returns-sub">—</div>
+      </div>
+      <div class="stat-card violet" id="stat-direction">
+        <div class="stat-label">ML Direction</div>
+        <div class="stat-value neutral" id="stat-dir-val">—</div>
+        <div class="stat-sub" id="stat-dir-sub">—</div>
+      </div>
+      <div class="stat-card green" id="stat-anomaly">
+        <div class="stat-label">Anomaly Status</div>
+        <div class="stat-value positive" id="stat-anomaly-val">✓ NORMAL</div>
+        <div class="stat-sub" id="stat-anomaly-sub">Stress: —/3</div>
+      </div>
+    </section>
+
+    <!-- Price Chart -->
+    <section class="card full-width" id="price-section">
+      <div class="card-header">
+        <div class="card-title">
+          <div class="card-title-icon blue">📈</div>
+          <span id="price-chart-title">Price History</span>
+        </div>
+        <div class="card-badge">market_pipeline.py → prices</div>
+      </div>
+      <div class="card-body">
+        <div class="chart-wrap tall"><canvas id="priceChart"></canvas></div>
+      </div>
+    </section>
+
+    <!-- Two-column: Predictions + News -->
+    <section class="dashboard-grid">
+      <!-- Predictions -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><div class="card-title-icon violet">🤖</div>Model Predictions</div>
+          <div class="card-badge">modeling.py → predictions</div>
+        </div>
+        <div class="card-body" id="predictions-body">
+          <div class="loading-container"><div class="spinner"></div><span>Loading predictions…</span></div>
+        </div>
+      </div>
+
+      <!-- News -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><div class="card-title-icon cyan">📰</div><span id="news-title">Latest News</span></div>
+          <div class="card-badge">news_pipeline.py → news</div>
+        </div>
+        <div class="card-body">
+          <ul class="news-list" id="news-list">
+            <li class="loading-container"><div class="spinner"></div><span>Loading news…</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- Two-column: Social + Technicals -->
+    <section class="dashboard-grid">
+      <!-- Social Anomaly -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><div class="card-title-icon rose">🔍</div>Social & Anomaly Signals</div>
+          <div class="card-badge">social_anomaly.py → social_anomaly</div>
+        </div>
+        <div class="card-body" id="social-body">
+          <div class="loading-container"><div class="spinner"></div><span>Loading signals…</span></div>
+        </div>
+      </div>
+
+      <!-- Technicals -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><div class="card-title-icon amber">📊</div>Technical Indicators</div>
+          <div class="card-badge">cleaning_pipeline.py → features</div>
+        </div>
+        <div class="card-body">
+          <div class="tech-charts">
+            <div><div class="tech-label">RSI (14)</div><div class="chart-wrap-sm"><canvas id="rsiChart"></canvas></div></div>
+            <div><div class="tech-label">Rolling Volatility (10d %)</div><div class="chart-wrap-sm"><canvas id="volChart"></canvas></div></div>
+            <div><div class="tech-label">Avg Sentiment (VADER)</div><div class="chart-wrap-sm"><canvas id="sentChart"></canvas></div></div>
+            <div><div class="tech-label">Volume Z-Score</div><div class="chart-wrap-sm"><canvas id="vzChart"></canvas></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- AI Agent -->
+    <section class="card full-width">
+      <div class="card-header">
+        <div class="card-title"><div class="card-title-icon green">🧠</div><span id="agent-title">AI Market Agent</span></div>
+        <div class="card-badge">market_agent.py → Gemini 2.5 Flash</div>
+      </div>
+      <div class="card-body">
+        <div class="agent-section">
+          <div class="agent-controls">
+            <button class="agent-btn" id="agent-btn" onclick="runAgent()">✨ Run AI Market Agent</button>
+            <span class="agent-meta">Powered by Gemini 2.5 Flash · Analyzes features + social + prediction data</span>
+          </div>
+          <div id="agent-output">
+            <div class="agent-placeholder">
+              <div class="empty-icon">🧠</div>
+              Click <strong>"Run AI Market Agent"</strong> to generate a comprehensive trading analysis.
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="app-footer">
+    EventOracle — Market Intelligence Platform · Built with Python + Flask + MongoDB
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
